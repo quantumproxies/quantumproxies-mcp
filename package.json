@@ -1,11 +1,12 @@
 {
   "name": "quantumproxies-mcp",
-  "version": "0.8.2",
+  "version": "0.9.0",
   "mcpName": "io.github.quantumproxies/quantumproxies-mcp",
-  "description": "MCP server for the QuantumProxies API — scrape, search, map, and crawl the web through residential proxies, and hand AI agents ready-to-use proxies of every type (residential, mobile, datacenter, ISP, IPv6). Connect QuantumProxies to Claude, Cursor, and any MCP client.",
+  "description": "MCP server for the QuantumProxies API \u2014 scrape, search, map, and crawl the web through residential proxies, and hand AI agents ready-to-use proxies of every type (residential, mobile, datacenter, ISP, IPv6). Connect QuantumProxies to Claude, Cursor, and any MCP client.",
   "type": "module",
   "bin": {
-    "quantumproxies-mcp": "dist/index.js"
+    "quantumproxies-mcp": "dist/index.js",
+    "quantumproxies-mcp-remote": "dist/remote.js"
   },
   "files": [
     "dist"

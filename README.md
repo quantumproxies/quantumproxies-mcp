@@ -55,6 +55,37 @@ claude mcp add quantumproxies \
 }
 ```
 
+## Hosted endpoint (remote MCP)
+
+The same server also runs as a hosted **Streamable HTTP** endpoint, for clients
+that prefer a URL over a local package:
+
+```
+https://api.quantumproxies.io/mcp
+```
+
+Your key travels per request in the `Authorization` header, so nothing is
+stored server-side and one endpoint serves every account:
+
+```bash
+curl -X POST https://api.quantumproxies.io/mcp \
+  -H "Authorization: Bearer qp_live_your_key_here" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+In a client that supports remote MCP servers, add it as an HTTP server with
+that URL and a bearer token. `initialize` and `tools/list` answer without a
+key so directories and inspectors can introspect the server; tool calls need
+one.
+
+Self-hosting the endpoint is a second binary in this same package:
+
+```bash
+QUANTUMPROXIES_API_KEY=qp_live_… PORT=9310 npx -y quantumproxies-mcp-remote
+```
+
 ## Run from source (development)
 
 ```bash
@@ -77,16 +108,6 @@ Then point the client at the local build instead of npx:
   }
 }
 ```
-
-## Run with Docker
-
-```bash
-docker build -t quantumproxies-mcp .
-docker run -i --rm -e QUANTUMPROXIES_API_KEY=your_key_here quantumproxies-mcp
-```
-
-The server starts even without a key so `initialize` / `tools/list` answer for
-inspectors and registries; tool calls then return a clear "key is not set" error.
 
 ## Env
 
