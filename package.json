@@ -1,0 +1,52 @@
+{
+  "name": "quantumproxies-mcp",
+  "version": "0.8.1",
+  "mcpName": "io.github.quantumproxies/quantumproxies-mcp",
+  "description": "MCP server for the QuantumProxies API — scrape, search, map, and crawl the web through residential proxies, and hand AI agents ready-to-use proxies of every type (residential, mobile, datacenter, ISP, IPv6). Connect QuantumProxies to Claude, Cursor, and any MCP client.",
+  "type": "module",
+  "bin": {
+    "quantumproxies-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "scraper",
+    "proxy",
+    "quantumproxies",
+    "claude",
+    "cursor",
+    "web-scraping",
+    "serp",
+    "crawl",
+    "residential-proxies",
+    "ai-agents"
+  ],
+  "author": "QuantumProxies <support@quantumproxies.io> (https://quantumproxies.io)",
+  "license": "MIT",
+  "homepage": "https://quantumproxies.io/mcp-server",
+  "bugs": {
+    "email": "support@quantumproxies.io"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.6.3"
+  }
+}
