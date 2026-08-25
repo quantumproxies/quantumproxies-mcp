@@ -78,6 +78,16 @@ Then point the client at the local build instead of npx:
 }
 ```
 
+## Run with Docker
+
+```bash
+docker build -t quantumproxies-mcp .
+docker run -i --rm -e QUANTUMPROXIES_API_KEY=your_key_here quantumproxies-mcp
+```
+
+The server starts even without a key so `initialize` / `tools/list` answer for
+inspectors and registries; tool calls then return a clear "key is not set" error.
+
 ## Env
 
 | Var | Default | Notes |

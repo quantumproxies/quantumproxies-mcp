@@ -20,12 +20,15 @@ const API_BASE = (process.env.QUANTUMPROXIES_API_BASE || "https://app.quantumpro
 );
 const API_KEY = process.env.QUANTUMPROXIES_API_KEY || "";
 
+const MISSING_KEY_MESSAGE =
+  "QUANTUMPROXIES_API_KEY is not set. Get a key at https://quantumproxies.io and set it in the MCP server env.";
+
 if (!API_KEY) {
-  // Fail loudly on stderr (stdout is the MCP transport and must stay clean).
-  console.error(
-    "QUANTUMPROXIES_API_KEY is not set. Get a key at https://quantumproxies.io and set it in the MCP server env."
-  );
-  process.exit(1);
+  // Warn on stderr (stdout is the MCP transport and must stay clean) but keep
+  // serving: clients that only introspect — tools/list, directory scanners,
+  // registries — must still get an answer. Tool calls fail with the same
+  // message instead of the process dying at startup.
+  console.error(MISSING_KEY_MESSAGE);
 }
 
 interface ApiResult {
@@ -58,6 +61,9 @@ function transportError(err: unknown, url: string): Error {
 }
 
 async function callApi(path: string, body: unknown, method: "POST" | "GET" | "DELETE" = "POST"): Promise<ApiResult> {
+  if (!API_KEY) {
+    return { ok: false, status: 401, data: { message: MISSING_KEY_MESSAGE } };
+  }
   const url = `${API_BASE}${path}`;
   let res: Response;
   try {
@@ -101,7 +107,7 @@ function toContent(result: ApiResult): { content: Array<{ type: "text"; text: st
 }
 
 // Keep in sync with package.json "version" (npm version does NOT touch this file).
-const server = new McpServer({ name: "quantumproxies", version: "0.8.1" });
+const server = new McpServer({ name: "quantumproxies", version: "0.8.2" });
 
 // ── scrape (extract) ────────────────────────────────────────────────────────
 server.tool(
