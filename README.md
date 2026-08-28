@@ -1,6 +1,6 @@
 # QuantumProxies MCP Server
 
-Connect [QuantumProxies](https://quantumproxies.io) to Claude, Cursor, and any
+Connect [QuantumProxies](https://quantumproxies.io) to Claude, Cursor, Cline, and any
 MCP client. Gives an AI agent live web access — scrape, search, map, and crawl —
 through residential proxies with real-browser TLS fingerprints, so pages that
 block ordinary bots come back clean. It also hands the agent raw proxy
@@ -41,7 +41,7 @@ claude mcp add quantumproxies \
   -- npx -y quantumproxies-mcp
 ```
 
-**Claude Desktop / Cursor / any MCP client** (`claude_desktop_config.json`, `.cursor/mcp.json`, or `.mcp.json`):
+**Claude Desktop / Cursor / Cline / any MCP client** (`claude_desktop_config.json`, `.cursor/mcp.json`, Cline's MCP settings, or `.mcp.json`):
 
 ```json
 {
@@ -75,10 +75,28 @@ curl -X POST https://api.quantumproxies.io/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-In a client that supports remote MCP servers, add it as an HTTP server with
-that URL and a bearer token. `initialize` and `tools/list` answer without a
-key so directories and inspectors can introspect the server; tool calls need
-one.
+The endpoint accepts either header — `Authorization: Bearer qp_live_your_key_here`
+(preferred) or `X-Api-Key: qp_live_your_key_here` — so clients that can't set an
+`Authorization` header can send the key directly.
+
+In a client that supports remote MCP servers, add it as an HTTP server with that
+URL and your key. For **Cline** (and any client that defaults to legacy SSE),
+set the transport type explicitly to `streamableHttp`:
+
+```json
+{
+  "mcpServers": {
+    "quantumproxies": {
+      "type": "streamableHttp",
+      "url": "https://api.quantumproxies.io/mcp",
+      "headers": { "Authorization": "Bearer qp_live_your_key_here" }
+    }
+  }
+}
+```
+
+`initialize` and `tools/list` answer without a key so directories and inspectors
+can introspect the server; tool calls need one.
 
 Self-hosting the endpoint is a second binary in this same package:
 
@@ -100,7 +118,7 @@ Then point the client at the local build instead of npx:
   "mcpServers": {
     "quantumproxies": {
       "command": "node",
-      "args": ["/absolute/path/to/scraper-mcp/dist/index.js"],
+      "args": ["/absolute/path/to/quantumproxies-mcp/dist/index.js"],
       "env": {
         "QUANTUMPROXIES_API_KEY": "qp_live_your_key_here"
       }
