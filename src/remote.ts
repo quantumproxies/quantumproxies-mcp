@@ -84,7 +84,7 @@ const httpServer = createServer(async (req, res) => {
   }
 
   try {
-    const server = buildServer({ apiKey: keyFrom(req) });
+    const server = buildServer({ apiKey: keyFrom(req), transport: "http" });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless: no session tracking
       enableJsonResponse: true, // plain JSON answers instead of an SSE stream

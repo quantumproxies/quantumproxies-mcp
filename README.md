@@ -123,3 +123,42 @@ Then point the client at the local build instead of npx:
 - "Map docs.example.com, then crawl only the /guides/ pages and summarize them."
 - "List my proxy plans and generate 5 sticky US residential proxies as socks5 URLs."
 - "Get me a rotating mobile proxy in Germany and whitelist my server IP 203.0.113.7."
+
+## Privacy Policy
+
+Full policy: <https://quantumproxies.io/privacy>
+
+**What this server sends.** It runs on your machine and talks only to the public
+QuantumProxies API at `https://app.quantumproxies.io/api/v1`, authenticated with
+your own `qp_live_` key. Each call carries the arguments you (or your agent)
+passed — the target URL or query, and any extraction prompt. Nothing else on your
+machine is read or transmitted: the server has no filesystem, shell or clipboard
+access.
+
+**What we collect.** Account data you give us (name, email, billing details) and
+a request log kept for billing, abuse prevention and support: target URL or
+query, timestamp, response status, bytes transferred and the API key used. We do
+**not** retain scraped page content beyond what is needed to return your result.
+
+**Data you collect through the service.** You decide what public web data to
+collect and **you are the controller of that data** — we process it on your
+behalf only to fulfil your request. You are responsible for using the service
+lawfully, for respecting the terms of the sites you access, and for any personal
+data you collect through it.
+
+**Sharing.** We do not sell personal data. We share it only with the processors
+that run the service — payment providers, email delivery, hosting, CDN and
+analytics — under contracts that bind them to protect it, and with the upstream
+proxy networks that route your traffic (connection metadata only, never your
+account details). We may disclose data where required by law.
+
+**Retention.** Account data for as long as the account exists; request logs on a
+rolling window for billing and abuse investigation. You can request deletion at
+any time.
+
+**Your key.** Claude Desktop stores it in the OS keychain and passes it to this
+server as an environment variable. It is never written to the bundle and never
+sent anywhere except the QuantumProxies API. Revoke or rotate it at
+<https://app.quantumproxies.io/api-keys>.
+
+**Contact.** <support@quantumproxies.io>

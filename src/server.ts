@@ -14,14 +14,30 @@ import { z } from "zod";
  * request with the key taken from the request's Authorization header.
  */
 
+/**
+ * How the caller is expected to supply their key. It differs per transport, and
+ * telling a hosted user to "set an environment variable" is useless advice —
+ * they are connecting from a client and have no shell on this process.
+ */
+export type Transport = "stdio" | "http";
+
 export const MISSING_KEY_MESSAGE =
   "QUANTUMPROXIES_API_KEY is not set. Get a key at https://quantumproxies.io and set it in the MCP server env.";
+
+const MISSING_KEY_MESSAGE_HTTP =
+  "No API key on this request. Get one at https://app.quantumproxies.io/api-keys and send it as an Authorization: Bearer <key> header (in Claude, paste the key when you connect this connector). Browsing the tool list needs no key; running a tool does.";
+
+export function missingKeyMessage(transport: Transport): string {
+  return transport === "http" ? MISSING_KEY_MESSAGE_HTTP : MISSING_KEY_MESSAGE;
+}
 
 export interface BuildOptions {
   /** API key; falls back to QUANTUMPROXIES_API_KEY. Empty = introspection only (tool calls answer 401). */
   apiKey?: string;
   /** API base; falls back to QUANTUMPROXIES_API_BASE. */
   apiBase?: string;
+  /** Shapes the "no key" instructions. Defaults to stdio (the npm package). */
+  transport?: Transport;
 }
 
 export function buildServer(opts: BuildOptions = {}): McpServer {
@@ -43,6 +59,13 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
    * `cause`, so an unreachable API (the usual case: a local dev server that isn't
    * running) reaches the agent as two useless words. Name the target and the
    * cause instead — every minute spent guessing at "fetch failed" is a wasted run.
+   *
+   * Every URL goes last on its own line, and nothing follows it. These messages
+   * get pasted into issues, forums and chat, where linkifiers extend a bare URL
+   * over whatever punctuation comes next: `…/scraper/extract (ECONNREFUSED)`
+   * turned into the indexed URL `…/scraper/extract%20(`, which Bing crawled as a
+   * 404 (66 such pageviews on 2026-08-26). A newline is the only terminator they
+   * all respect — angle brackets and quotes get swallowed just like parentheses.
    */
   function transportError(err: unknown, url: string): Error {
     const cause = (err as { cause?: { code?: string; message?: string } })?.cause;
@@ -50,19 +73,23 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     const detail = code ?? cause?.message ?? (err as Error)?.message ?? String(err);
     let hint = "";
     if (code === "ECONNREFUSED" || code === "ECONNRESET")
-      hint = ` — nothing is listening there. Is the API up? (QUANTUMPROXIES_API_BASE=${API_BASE})`;
+      hint = " — nothing is listening there. Is the API up?";
     else if (code === "ENOTFOUND" || code === "EAI_AGAIN")
-      hint = ` — host does not resolve. Check QUANTUMPROXIES_API_BASE=${API_BASE}`;
+      hint = " — host does not resolve. Check QUANTUMPROXIES_API_BASE.";
     else if ((err as Error)?.name === "TimeoutError" || code === "UND_ERR_HEADERS_TIMEOUT")
       hint = " — request timed out after 90s.";
     else if (code === "CERT_HAS_EXPIRED" || code?.startsWith?.("ERR_TLS"))
       hint = " — TLS handshake failed.";
-    return new Error(`Cannot reach the QuantumProxies API at ${url} (${detail})${hint}`);
+    return new Error(
+      `Cannot reach the QuantumProxies API (${detail})${hint}\n` +
+        `Endpoint: ${url}\n` +
+        `QUANTUMPROXIES_API_BASE: ${API_BASE}`
+    );
   }
 
   async function callApi(path: string, body: unknown, method: "POST" | "GET" | "DELETE" = "POST"): Promise<ApiResult> {
     if (!API_KEY) {
-      return { ok: false, status: 401, data: { message: MISSING_KEY_MESSAGE } };
+      return { ok: false, status: 401, data: { message: missingKeyMessage(opts.transport ?? "stdio") } };
     }
     const url = `${API_BASE}${path}`;
     let res: Response;
@@ -106,8 +133,10 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     return { content: [{ type: "text", text }] };
   }
 
-  // Keep in sync with package.json "version" (npm version does NOT touch this file).
-  const server = new McpServer({ name: "quantumproxies", version: "0.9.0" });
+  // Riallineato da scripts/sync-version.mjs, che `npm run build` esegue sempre:
+  // `npm version` non tocca questo file, e il bundle MCPB ha già dichiarato
+  // 0.9.0 con package.json a 0.9.1.
+  const server = new McpServer({ name: "quantumproxies", version: "0.9.1" });
 
   // ── scrape (extract) ────────────────────────────────────────────────────────
   server.tool(
@@ -279,6 +308,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .optional()
         .describe("Cookies to send as name→value — the simple way to scrape behind a login"),
     },
+    {
+      title: "Scrape a web page",
+      readOnlyHint: true,
+      openWorldHint: true,
+    },
     async (args) => {
       // fetch_resource is exposed as a flat string for ergonomics; the API takes
       // it as an ordered action, which must come last so nothing runs after the
@@ -327,6 +361,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .describe("Learn from the browser-rendered DOM instead of the raw HTML (needed for SPA pages)"),
       country: z.string().length(2).optional().describe("ISO country code for the proxy exit"),
     },
+    {
+      title: "Generate a parser",
+      readOnlyHint: true,
+      openWorldHint: true,
+    },
     async (args) => toContent(await callApi("/scraper/parser/generate", args))
   );
 
@@ -351,6 +390,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       render: z.boolean().optional().describe("The page needs a browser render to show its content"),
       auto_heal: z.boolean().optional().describe("Regenerate automatically on decay (default true when source_url is set)"),
     },
+    {
+      title: "Save a parser preset",
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
+    },
     async ({ name, parser, source_url, fields, render, auto_heal }) =>
       toContent(
         await callApi("/scraper/parser/presets", {
@@ -368,6 +413,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     "list_parser_presets",
     "List your stored parser presets with their version, health stats and changelog.",
     {},
+    {
+      title: "List parser presets",
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async () => toContent(await callApi("/scraper/parser/presets", null, "GET"))
   );
 
@@ -375,6 +426,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     "parser_preset_stats",
     "How well a stored parser is still working: success rate per field, mean coverage over the recent runs, and whether it now counts as decayed (i.e. the site probably changed).",
     { preset_id: z.string().describe("The preset id returned by save_parser_preset") },
+    {
+      title: "Parser preset health",
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async ({ preset_id }) =>
       toContent(await callApi(`/scraper/parser/presets/${encodeURIComponent(preset_id)}/stats`, null, "GET"))
   );
@@ -385,6 +442,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       preset_id: z.string().describe("The preset id"),
       force: z.boolean().optional().describe("Bypass the cooldown between heals"),
+    },
+    {
+      title: "Repair a parser preset",
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: true,
     },
     async ({ preset_id, force }) =>
       toContent(await callApi(`/scraper/parser/presets/${encodeURIComponent(preset_id)}/heal`, { force }))
@@ -401,6 +464,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .boolean()
         .optional()
         .describe("Skip the rendered pass (cheaper — returns the no-JS view only, no diff)"),
+    },
+    {
+      title: "Audit a page for SEO",
+      readOnlyHint: true,
+      openWorldHint: true,
     },
     async (args) => toContent(await callApi("/scraper/seo-audit", args))
   );
@@ -513,6 +581,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .optional()
         .describe("Reviews: continuation token from the previous response's serpapi_pagination"),
     },
+    {
+      title: "Search the web",
+      readOnlyHint: true,
+      openWorldHint: true,
+    },
     async (args) => toContent(await callApi("/scraper/serp", args))
   );
 
@@ -544,6 +617,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .optional()
         .describe("False returns snippet-only context without fetching result pages"),
     },
+    {
+      title: "Search and read results",
+      readOnlyHint: true,
+      openWorldHint: true,
+    },
     async (args) => toContent(await callApi("/ai/search", args))
   );
 
@@ -570,6 +648,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .describe("path: return the path tree with per-prefix counts instead of the flat URL list"),
       includeSubdomains: z.boolean().optional().describe("Include subdomains of the seed host"),
     },
+    {
+      title: "Map a site's URLs",
+      readOnlyHint: true,
+      openWorldHint: true,
+    },
     async (args) => toContent(await callApi("/scraper/map", args))
   );
 
@@ -589,6 +672,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       exclude: z.array(z.string()).optional().describe("URL substrings/globs to exclude"),
       country: z.string().length(2).optional().describe("ISO country code for the proxy exit"),
     },
+    {
+      title: "Crawl a site",
+      readOnlyHint: true,
+      openWorldHint: true,
+    },
     async (args) => toContent(await callApi("/scraper/crawl", args))
   );
 
@@ -607,6 +695,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .boolean()
         .optional()
         .describe("Include each page's full content (default false — metadata only)"),
+    },
+    {
+      title: "Crawl status",
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async ({ jobId, since, include_content }) => {
       const query = new URLSearchParams();
@@ -639,6 +733,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .describe("summary: per-URL metadata only, no page content — the light mode for audits"),
       country: z.string().length(2).optional().describe("ISO country code for the proxy exit"),
     },
+    {
+      title: "Scrape URLs in batch",
+      readOnlyHint: true,
+      openWorldHint: true,
+    },
     async (args) => toContent(await callApi("/scraper/batch", args))
   );
 
@@ -657,6 +756,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .boolean()
         .optional()
         .describe("Include each item's full page content (default false — metadata only)"),
+    },
+    {
+      title: "Batch status",
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async ({ jobId, since, include_content }) => {
       const query = new URLSearchParams();
@@ -703,6 +808,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .describe("Additional Google query parameters"),
       webhook: z.string().url().optional().describe("Public URL to POST the finished job to"),
     },
+    {
+      title: "Bulk search",
+      readOnlyHint: true,
+      openWorldHint: true,
+    },
     async (args) => toContent(await callApi("/scraper/serp/bulk", args))
   );
 
@@ -717,6 +827,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .min(0)
         .optional()
         .describe("Organic cursor from the previous poll's `nextCursor` — returns only newer results"),
+    },
+    {
+      title: "Bulk search status",
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async ({ jobId, since }) => {
       const query = new URLSearchParams();
@@ -763,6 +879,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .optional(),
       webhook: z.string().url().optional().describe("Public URL to POST the finished dataset to"),
     },
+    {
+      title: "Build a dataset",
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: true,
+    },
     async (args) => toContent(await callApi("/scraper/datasets", args))
   );
 
@@ -778,6 +900,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .optional()
         .describe("Row cursor from the previous poll's `nextCursor` — returns only newer rows"),
       mode: z.enum(["summary"]).optional().describe("summary: progress + steps only, no rows"),
+    },
+    {
+      title: "Dataset status",
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async ({ jobId, since, mode }) => {
       const query = new URLSearchParams();
@@ -814,6 +942,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       planType: z.enum(PLAN_TYPES).optional().describe("Only services of this plan type"),
       limit: z.number().int().min(1).max(100).optional().describe("Max services returned (default 50)"),
       offset: z.number().int().min(0).optional().describe("Pagination offset (default 0)"),
+    },
+    {
+      title: "List proxy services",
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async ({ active, planType, limit, offset }) => {
       const query = new URLSearchParams();
@@ -873,6 +1007,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .describe("Mobile V2 only: a whitelisted IP (see whitelist_ip) to fetch the IP-auth proxy list instead of user:pass proxies"),
       gateway: z.enum(["ww", "us", "eu", "as"]).optional().describe("Mobile V2 region gateway (default ww)"),
     },
+    {
+      title: "Generate proxy credentials",
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
+    },
     async (args) => toContent(await callApi("/public/proxies/generate", args))
   );
 
@@ -889,6 +1029,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         ),
       country: z.string().max(10).optional().describe("Country code, required for states/cities, optional filter for asns"),
       state: z.string().optional().describe("Cities only: filter by state"),
+    },
+    {
+      title: "Proxy locations",
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async ({ planType, level, country, state }) => {
       const lvl = level || "countries";
@@ -924,6 +1070,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       sticky: z.boolean().optional().describe("Mobile add: keep the same IP per port"),
       ttl: z.number().int().min(1).optional().describe("Mobile add: sticky session TTL in seconds"),
     },
+    {
+      title: "Manage the IP whitelist",
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+    },
     async ({ action, orderId, ip, ...mobileOpts }) => {
       if (action === "list") {
         return toContent(await callApi(`/public/proxies/whitelist-ip?orderId=${encodeURIComponent(orderId)}`, null, "GET"));
@@ -948,6 +1100,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       category: z.string().max(40).optional().describe("Optional category filter (e.g. 'local', 'ecommerce', 'jobs', 'news', 'travel', 'leads', 'finance', 'dev', 'gaming', 'osint', 'research', 'classifieds', 'knowledge')"),
     },
+    {
+      title: "List collectors",
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     async ({ category }) => {
       const qs = category ? `?category=${encodeURIComponent(category)}` : "";
       return toContent(await callApi(`/scraper/collectors${qs}`, null, "GET"));
@@ -962,6 +1120,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       input: z.record(z.unknown()).describe("Input fields matching the collector's inputSchema (e.g. { keyword: 'dentist', location: 'Austin, TX', max_results: 20 })"),
       async: z.boolean().optional().describe("Force background execution and return a run_id to poll"),
     },
+    {
+      title: "Run a collector",
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: true,
+    },
     async ({ slug, input, async: asyncRun }) =>
       toContent(await callApi(`/scraper/collectors/${encodeURIComponent(slug)}/run`, { ...input, ...(asyncRun ? { async: true } : {}) }))
   );
@@ -972,6 +1136,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       run_id: z.string().min(1).describe("The run id returned by run_collector"),
       format: z.enum(["json", "csv"]).optional().describe("Return rows as JSON (default) or CSV text"),
+    },
+    {
+      title: "Collector run status",
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
     },
     async ({ run_id, format }) => {
       const qs = format === "csv" ? "?format=csv" : "";

@@ -1,0 +1,18 @@
+// Il server MCP dichiara la sua versione a runtime con un literal in src/server.ts.
+// `npm version` non tocca i sorgenti, quindi senza questo passo il bundle si
+// presenta con una versione diversa da quella del suo manifest.
+import { readFileSync, writeFileSync } from "node:fs";
+
+const { version } = JSON.parse(readFileSync("package.json", "utf8"));
+const file = "src/server.ts";
+const before = readFileSync(file, "utf8");
+const after = before.replace(
+  /(new McpServer\(\{ name: "[a-z]+", version: )"[^"]*"/,
+  `$1"${version}"`
+);
+if (before === after && !after.includes(`version: "${version}"`)) {
+  console.error(`sync-version: literal non trovato in ${file}`);
+  process.exit(1);
+}
+writeFileSync(file, after);
+console.log(`sync-version: ${file} -> ${version}`);

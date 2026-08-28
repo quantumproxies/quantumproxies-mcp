@@ -1,0 +1,142 @@
+{
+  "manifest_version": "0.3",
+  "name": "quantumproxies",
+  "display_name": "QuantumProxies",
+  "version": "0.9.1",
+  "description": "Live web access for Claude: scrape any page as clean Markdown, search and read the results, map and crawl sites, and pull typed rows from 74 ready-made collectors \u2014 through residential proxies with real browser TLS fingerprints.",
+  "long_description": "QuantumProxies gives Claude a reliable way to read the live web.\n\nAsk for a page and get clean Markdown, not raw HTML: JavaScript is rendered when the page needs it, tables and links survive, and navigation and cookie chrome are stripped. Ask a question instead and it searches Google, Bing or DuckDuckGo and reads the top results in one step.\n\nBeyond single pages it maps a site's URL tree, crawls a section in the background, and audits what a page serves before JavaScript runs.\n\nFor structured data there are 74 ready-made collectors: name a source and give it a semantic input \u2014 a keyword and a city, a product id, a company domain, a repository, a ticker \u2014 and get typed rows back, billed per delivered row. Failures are never charged.\n\nIt also hands the agent raw proxy endpoints of every type (residential, mobile, datacenter, ISP, IPv6) from your active plans.\n\nThe server calls the PUBLIC QuantumProxies API with your own key. Nothing runs on our infrastructure that you do not trigger, and no internal secrets are involved.",
+  "author": {
+    "name": "QuantumProxies",
+    "url": "https://quantumproxies.io"
+  },
+  "homepage": "https://quantumproxies.io/mcp-server",
+  "documentation": "https://quantumproxies.io/mcp-server",
+  "support": "https://quantumproxies.io/contact",
+  "icon": "icon.png",
+  "license": "MIT",
+  "keywords": [
+    "web",
+    "scraping",
+    "search",
+    "serp",
+    "crawl",
+    "proxy",
+    "data",
+    "research",
+    "leads"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/dist/index.js"
+      ],
+      "env": {
+        "QUANTUMPROXIES_API_KEY": "${user_config.api_key}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "scrape"
+    },
+    {
+      "name": "seo_audit"
+    },
+    {
+      "name": "search"
+    },
+    {
+      "name": "search_and_read"
+    },
+    {
+      "name": "search_bulk"
+    },
+    {
+      "name": "search_bulk_status"
+    },
+    {
+      "name": "map"
+    },
+    {
+      "name": "crawl"
+    },
+    {
+      "name": "crawl_status"
+    },
+    {
+      "name": "batch"
+    },
+    {
+      "name": "batch_status"
+    },
+    {
+      "name": "create_dataset"
+    },
+    {
+      "name": "dataset_status"
+    },
+    {
+      "name": "generate_parser"
+    },
+    {
+      "name": "save_parser_preset"
+    },
+    {
+      "name": "list_parser_presets"
+    },
+    {
+      "name": "parser_preset_stats"
+    },
+    {
+      "name": "heal_parser_preset"
+    },
+    {
+      "name": "list_collectors"
+    },
+    {
+      "name": "run_collector"
+    },
+    {
+      "name": "collector_run_status"
+    },
+    {
+      "name": "list_proxies"
+    },
+    {
+      "name": "generate_proxies"
+    },
+    {
+      "name": "proxy_locations"
+    },
+    {
+      "name": "whitelist_ip"
+    }
+  ],
+  "tools_generated": false,
+  "user_config": {
+    "api_key": {
+      "type": "string",
+      "title": "QuantumProxies API key",
+      "description": "Your qp_live_ key from https://app.quantumproxies.io/api-keys . Usage is prepaid from your wallet balance; browsing the tool list is free, running a tool is not.",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "privacy_policies": [
+    "https://quantumproxies.io/privacy"
+  ],
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  }
+}
