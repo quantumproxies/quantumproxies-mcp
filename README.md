@@ -139,6 +139,7 @@ Then point the client at the local build instead of npx:
 |-----|---------|-------|
 | `QUANTUMPROXIES_API_KEY` | — | **Required.** Your `qp_live_` key. |
 | `QUANTUMPROXIES_API_BASE` | `https://app.quantumproxies.io/api/v1` | Override for staging/self-host. |
+| `QUANTUMPROXIES_TOOLS` | all 28 | Load only some tools: names (`search,scrape`) or a preset (`lite`, `web`, `research`, `collectors`, `proxies`). See below. |
 
 Self-hosted remote endpoint only (`quantumproxies-mcp-remote`), optional:
 
@@ -148,6 +149,24 @@ Self-hosted remote endpoint only (`quantumproxies-mcp-remote`), optional:
 | `MCP_OAUTH_ISSUER` | `https://app.quantumproxies.io` | Authorization server advertised in the resource metadata. |
 | `MCP_OAUTH_INTROSPECT_URL` | `http://127.0.0.1:3090/api/v1/internal/oauth/introspect` | Where OAuth access tokens are checked. |
 | `MCP_INTERNAL_TOKEN` | — | Secret for the introspection call. Unset = only API keys are accepted. |
+
+## Local models (Ollama, LM Studio, Qwen, Open WebUI)
+
+The 28 tool definitions are about 14,000 tokens. A local model on Ollama's default
+4K context cannot hold them, and a 32K context loses almost half its room before the
+first page. Load fewer tools:
+
+| Preset | Tools | Definition tokens |
+|--------|-------|-------------------|
+| `lite` | search_and_read | ~360 |
+| `web` | search, search_and_read, scrape | ~4,200 |
+| `research` | web + map, batch, batch_status | ~5,100 |
+| `collectors` | list_collectors, run_collector, collector_run_status | ~830 |
+| `proxies` | list_proxies, generate_proxies, proxy_locations, whitelist_ip | ~1,800 |
+
+Over stdio set `QUANTUMPROXIES_TOOLS=web`. On the hosted endpoint add `?tools=web` to the
+URL and send your API key as a Bearer header:
+`https://api.quantumproxies.io/mcp?tools=web`. Names can be combined: `?tools=lite,collectors`.
 
 ## Example prompts
 

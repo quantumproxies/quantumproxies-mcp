@@ -180,6 +180,13 @@ function isChatGPT(grant: Grant | null, clientInfo: { name?: string } | null): b
   return /^openai-mcp$/i.test(clientInfo?.name ?? "");
 }
 
+/** `?tools=web` or `?tools=search,scrape` on the endpoint URL: a smaller tool set for local models. */
+function toolsFrom(req: IncomingMessage): string | undefined {
+  const query = (req.url || "").split("?")[1];
+  if (!query) return undefined;
+  return new URLSearchParams(query).get("tools") || undefined;
+}
+
 /** 401 with the RFC 9728 challenge: this is what starts the OAuth flow in the client. */
 function challenge(res: ServerResponse, error?: "invalid_token", description?: string) {
   const parts = [`resource_metadata="${RESOURCE_METADATA_URL}"`, `scope="mcp"`];
@@ -294,6 +301,7 @@ const httpServer = createServer(async (req, res) => {
       clientIp: clientIpFrom(req),
       auth: viaOAuth ? "oauth" : "key",
       profile: isChatGPT(grant, clientInfo) ? "chatgpt" : undefined,
+      tools: toolsFrom(req),
     });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless: no session tracking

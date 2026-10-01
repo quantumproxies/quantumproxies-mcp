@@ -208,6 +208,13 @@ export interface BuildOptions {
    * offered. Anything else: the full server.
    */
   profile?: "chatgpt";
+  /**
+   * Expose only these tools (comma-separated names or presets, e.g. "web" or
+   * "search,scrape"). Falls back to QUANTUMPROXIES_TOOLS. Meant for local models:
+   * the full set of definitions is about 14K tokens, more than Ollama's default
+   * 4K context. Unknown names are ignored; if nothing matches, every tool stays.
+   */
+  tools?: string;
 }
 
 /**
@@ -218,7 +225,7 @@ export interface BuildOptions {
  * La versione la riallinea scripts/sync-version.mjs insieme a quella
  * dichiarata dall'McpServer; il nome lo brandifica quantic-mcp/sync-from-scraper-mcp.sh.
  */
-const MCP_UA_BASE = "quantumproxies-mcp/0.11.3";
+const MCP_UA_BASE = "quantumproxies-mcp/0.11.4";
 /** The version this build declares (kept in step with package.json by scripts/sync-version.mjs). */
 export const MCP_VERSION = MCP_UA_BASE.split("/")[1] ?? "0.0.0";
 /** QP | QD — which brand this build serves (the sync script rebrands the package name). */
@@ -249,6 +256,24 @@ const CHATGPT_HIDDEN_COLLECTORS = new Set([
 const CHATGPT_HIDDEN_CATEGORIES = new Set(["leads"]);
 function hiddenInChatGPT(c: any): boolean {
   return CHATGPT_HIDDEN_COLLECTORS.has(String(c?.slug)) || CHATGPT_HIDDEN_CATEGORIES.has(String(c?.category ?? "").toLowerCase());
+}
+
+/** Named tool sets for clients with small context windows. */
+const TOOL_PRESETS: Record<string, string[]> = {
+  lite: ["search_and_read"],
+  web: ["search", "search_and_read", "scrape"],
+  research: ["search", "search_and_read", "scrape", "map", "batch", "batch_status"],
+  collectors: ["list_collectors", "run_collector", "collector_run_status"],
+  proxies: ["list_proxies", "generate_proxies", "proxy_locations", "whitelist_ip"],
+};
+
+function parseToolList(raw: string | undefined): Set<string> | null {
+  const names = String(raw ?? "")
+    .split(/[\s,]+/)
+    .map((n) => n.trim().toLowerCase())
+    .filter(Boolean)
+    .flatMap((n) => TOOL_PRESETS[n] ?? [n]);
+  return names.length ? new Set(names) : null;
 }
 
 export function buildServer(opts: BuildOptions = {}): McpServer {
@@ -541,7 +566,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
   // `npm version` non tocca questo file, e il bundle MCPB ha già dichiarato
   // 0.9.0 con package.json a 0.9.1.
   const server = new McpServer(
-    { name: "quantumproxies", version: "0.11.3" },
+    { name: "quantumproxies", version: "0.11.4" },
     // Keyless sessions get the tier explained where the model reads it first.
     KEYLESS ? { instructions: KEYLESS_INSTRUCTIONS } : undefined
   );
@@ -2021,6 +2046,13 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       return { content: [{ type: "text", text }] };
     }
   );
+
+  // Tool subset (QUANTUMPROXIES_TOOLS=web, or ?tools=web on the hosted URL).
+  const wanted = parseToolList(opts.tools ?? process.env.QUANTUMPROXIES_TOOLS);
+  const registry = (server as any)._registeredTools as Record<string, { remove(): void }> | undefined;
+  if (wanted && registry && Object.keys(registry).some((name) => wanted.has(name))) {
+    for (const [name, tool] of Object.entries(registry)) if (!wanted.has(name)) tool.remove();
+  }
 
   return server;
 }

@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "quantumproxies",
   "display_name": "QuantumProxies",
-  "version": "0.11.3",
+  "version": "0.11.4",
   "description": "Live web access for Claude: scrape any page as clean Markdown, search and read the results, map and crawl sites, and pull typed rows from 74 ready-made collectors — through residential proxies with real browser TLS fingerprints.",
   "long_description": "QuantumProxies gives Claude a reliable way to read the live web.\n\nAsk for a page and get clean Markdown, not raw HTML: JavaScript is rendered when the page needs it, tables and links survive, and navigation and cookie chrome are stripped. Ask a question instead and it searches Google, Bing or DuckDuckGo and reads the top results in one step.\n\nBeyond single pages it maps a site's URL tree, crawls a section in the background, and audits what a page serves before JavaScript runs.\n\nFor structured data there are 74 ready-made collectors: name a source and give it a semantic input — a keyword and a city, a product id, a company domain, a repository, a ticker — and get typed rows back, billed per delivered row. Failures are never charged.\n\nIt also hands the agent raw proxy endpoints of every type (residential, mobile, datacenter, ISP, IPv6) from your active plans.\n\nThe server calls the PUBLIC QuantumProxies API with your own key. Nothing runs on our infrastructure that you do not trigger, and no internal secrets are involved.",
   "author": {
