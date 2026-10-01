@@ -1,6 +1,6 @@
 # QuantumProxies MCP Server
 
-Connect [QuantumProxies](https://quantumproxies.io) to Claude, Cursor, Cline, and any
+Connect [QuantumProxies](https://quantumproxies.io) to Claude, Cursor, and any
 MCP client. Gives an AI agent live web access — scrape, search, map, and crawl —
 through residential proxies with real-browser TLS fingerprints, so pages that
 block ordinary bots come back clean. It also hands the agent raw proxy
@@ -15,7 +15,9 @@ so there are no internal secrets and you run it locally.
 | Tool | What it does |
 |------|--------------|
 | `scrape` | Scrape one URL → Markdown/HTML/text, including PDF/Office documents. Supports multi-format output, absolute link collection, JSON-LD metadata, structured CSS extraction, AI prompt/JSON-schema extraction, and `mode: summary`. |
+| `unlock` | Web Unlocker: replay any HTTP request (method, headers, body) through a residential exit with a real browser TLS fingerprint, retry on a fresh IP, escalate a blocked GET to a real browser. Returns the raw response (status, headers, body); a still-blocked page comes back flagged (`blocked`, `blockClass`, `vendor`), never as a silent 200. Interactive captchas are not solved (`blockClass: "captcha"`). |
 | `seo_audit` | Fetch a URL as a no-JS bot **and** fully rendered, return both SEO views + the diff (JS-only content, changed title/description, missing canonical) and bot-facing meta (robots, OG, JSON-LD). |
+| `ai_visibility` | Can ChatGPT, Claude, Perplexity, Google AI Overview and Bing Copilot read **and cite** a page? On-page audit (24 AI crawlers in robots.txt, Content-Signal, a fetch as GPTBot, noindex/nosnippet/noai, text without JS, JSON-LD entities, answer-shaped copy, dates with age, author, sources) scored per pillar with blockers, evidence and fixes — plus an optional citation panel that asks the engines and reports cited / mentioned / rank, share of voice and who wins the questions you are absent from. |
 | `search` | Structured Google/Bing/DuckDuckGo results. Set `render: true` for Google AI Overview, PAA, Knowledge Graph and other JS enrichments. |
 | `search_and_read` | SERP → fetch top pages → numbered citation-ready sources and one token-bounded context string ready for an AI prompt. |
 | `search_bulk` / `search_bulk_status` | Async multi-page pagination with merged organic results and page-one AI/zero-click enrichments. |
@@ -28,6 +30,7 @@ so there are no internal secrets and you run it locally.
 | `generate_proxies` | Ready-to-use proxy strings (credentials included) from any active plan: geo targeting (country/state/city/ISP/ASN), rotating or sticky sessions, HTTP or SOCKS5, several output formats. |
 | `proxy_locations` | Valid geo-targeting values per plan type: countries, states, cities, ASNs, or the full location tree with ISP codes. |
 | `whitelist_ip` | Manage IP-auth whitelisting (add/list/remove) for plans that support it, including the Mobile V2 IP-auth proxy list. |
+| `report` | Send feedback to the team from inside the agent: a bug (wrong/empty result, error, blocked page), a missing feature or collector, a question. Works **without an API key**. |
 
 ## Quick start
 
@@ -41,7 +44,7 @@ claude mcp add quantumproxies \
   -- npx -y quantumproxies-mcp
 ```
 
-**Claude Desktop / Cursor / Cline / any MCP client** (`claude_desktop_config.json`, `.cursor/mcp.json`, Cline's MCP settings, or `.mcp.json`):
+**Claude Desktop / Cursor / any MCP client** (`claude_desktop_config.json`, `.cursor/mcp.json`, or `.mcp.json`):
 
 ```json
 {
@@ -64,8 +67,28 @@ that prefer a URL over a local package:
 https://api.quantumproxies.io/mcp
 ```
 
-Your key travels per request in the `Authorization` header, so nothing is
-stored server-side and one endpoint serves every account:
+### Connect with OAuth (no key to copy)
+
+The endpoint supports the MCP authorization spec (OAuth 2.1). In a client that
+supports it, add the URL above as a remote server and nothing else:
+
+1. The client opens the QuantumProxies.io sign-in page.
+2. You sign in (or create a free account) and click **Allow access**.
+3. The client is connected. A key named `MCP · <client>` appears on the
+   dashboard API keys page; delete it to disconnect the client.
+
+Under the hood: authorization server metadata at
+`https://app.quantumproxies.io/.well-known/oauth-authorization-server`,
+protected resource metadata at
+`https://api.quantumproxies.io/.well-known/oauth-protected-resource/mcp`,
+dynamic client registration (RFC 7591) and Client ID Metadata Documents,
+PKCE (S256) required, 1-hour access tokens with rotating refresh tokens, tokens
+bound to this endpoint (RFC 8707). Usage is billed to your balance like any key.
+
+### Or send your API key
+
+Clients that take a bearer token can skip OAuth: the key travels per request in
+the `Authorization` header (or `X-Api-Key`), nothing is stored server-side.
 
 ```bash
 curl -X POST https://api.quantumproxies.io/mcp \
@@ -75,30 +98,13 @@ curl -X POST https://api.quantumproxies.io/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-The endpoint accepts either header — `Authorization: Bearer qp_live_your_key_here`
-(preferred) or `X-Api-Key: qp_live_your_key_here` — so clients that can't set an
-`Authorization` header can send the key directly.
+A request with neither a token nor a key gets `401` with a
+`WWW-Authenticate` header pointing at the metadata above: that is what makes
+OAuth-capable clients start the sign-in.
 
-In a client that supports remote MCP servers, add it as an HTTP server with that
-URL and your key. For **Cline** (and any client that defaults to legacy SSE),
-set the transport type explicitly to `streamableHttp`:
-
-```json
-{
-  "mcpServers": {
-    "quantumproxies": {
-      "type": "streamableHttp",
-      "url": "https://api.quantumproxies.io/mcp",
-      "headers": { "Authorization": "Bearer qp_live_your_key_here" }
-    }
-  }
-}
-```
-
-`initialize` and `tools/list` answer without a key so directories and inspectors
-can introspect the server; tool calls need one.
-
-Self-hosting the endpoint is a second binary in this same package:
+Self-hosting the endpoint is a second binary in this same package. With
+`QUANTUMPROXIES_API_KEY` set it serves that one account to callers that send no
+credential:
 
 ```bash
 QUANTUMPROXIES_API_KEY=qp_live_… PORT=9310 npx -y quantumproxies-mcp-remote
@@ -118,7 +124,7 @@ Then point the client at the local build instead of npx:
   "mcpServers": {
     "quantumproxies": {
       "command": "node",
-      "args": ["/absolute/path/to/quantumproxies-mcp/dist/index.js"],
+      "args": ["/absolute/path/to/scraper-mcp/dist/index.js"],
       "env": {
         "QUANTUMPROXIES_API_KEY": "qp_live_your_key_here"
       }
@@ -133,6 +139,15 @@ Then point the client at the local build instead of npx:
 |-----|---------|-------|
 | `QUANTUMPROXIES_API_KEY` | — | **Required.** Your `qp_live_` key. |
 | `QUANTUMPROXIES_API_BASE` | `https://app.quantumproxies.io/api/v1` | Override for staging/self-host. |
+
+Self-hosted remote endpoint only (`quantumproxies-mcp-remote`), optional:
+
+| Var | Default | Notes |
+|-----|---------|-------|
+| `MCP_OAUTH_RESOURCE` | `https://api.quantumproxies.io/mcp` | This endpoint as an OAuth resource. |
+| `MCP_OAUTH_ISSUER` | `https://app.quantumproxies.io` | Authorization server advertised in the resource metadata. |
+| `MCP_OAUTH_INTROSPECT_URL` | `http://127.0.0.1:3090/api/v1/internal/oauth/introspect` | Where OAuth access tokens are checked. |
+| `MCP_INTERNAL_TOKEN` | — | Secret for the introspection call. Unset = only API keys are accepted. |
 
 ## Example prompts
 

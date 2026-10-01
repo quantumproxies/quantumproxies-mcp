@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { instrumentServer } from "./analytics.js";
 import { z } from "zod";
 
 /**
@@ -21,15 +22,159 @@ import { z } from "zod";
  */
 export type Transport = "stdio" | "http";
 
+const REGISTER_URL = "https://app.quantumproxies.io/register";
+/**
+ * Every register link the server hands out says WHY it was shown: the signup
+ * flow keeps utm_source as User.signupSource, so /admin/mcp can count how many
+ * accounts the MCP itself brought in, and from which door (no key, trial used
+ * up, tool outside the trial…). Same page, different label.
+ */
+function registerUrl(medium: "no_key" | "rejected_key" | "keyless"): string {
+  return `${REGISTER_URL}?utm_source=mcp&utm_medium=${medium}`;
+}
+const KEYS_URL = "https://app.quantumproxies.io/api-keys";
+const BALANCE_URL = "https://app.quantumproxies.io/balance";
+/**
+ * Informational price list (no checkout on it). The hosted endpoint is what the
+ * ChatGPT plugin directory reviews, and its guidelines forbid linking a
+ * transactional page or promoting upgrades from inside a plugin: they allow only
+ * explaining that the account's balance does not cover a feature, with a link to
+ * an informational page. So over HTTP the out-of-credit message points here
+ * instead of the top-up page.
+ */
+const PRICING_URL = "https://quantumproxies.io/pricing/";
+const UNLOCK_URL = "https://app.quantumproxies.io/unlock";
+
+/**
+ * Someone running a tool without a key is not a bug report — it is a developer
+ * evaluating the product from inside their agent, and this string is the only
+ * pitch we get to make. "Invalid key" tells them nothing and ends the trial
+ * there; what converts is naming what they would get and handing them the two
+ * links that unlock it. The agent relaying this to a human is the audience.
+ *
+ * Claims stay checkable: no $ figures and no exact counts, because both live in
+ * the DB (SiteSetting `scraper_billing_config`, the collector catalog) while
+ * this string ships pinned inside an npm package and would go stale silently.
+ */
+const PITCH =
+  "With a key this server hands your agent live web data: any page as clean Markdown through " +
+  "residential proxies with a real Chrome TLS fingerprint, Google/Bing/DuckDuckGo SERP, whole-site " +
+  "crawl and map, AI extraction, and 70+ ready-made collectors (maps, jobs, marketplaces, e-commerce, " +
+  "public registries). No proxy plumbing, no headless browser to keep alive. You pay per call, and " +
+  "every account starts with a free monthly allowance — thousands of pages before it costs anything.";
+
 export const MISSING_KEY_MESSAGE =
-  "QUANTUMPROXIES_API_KEY is not set. Get a key at https://quantumproxies.io and set it in the MCP server env.";
+  "Nothing ran: this QuantumProxies MCP server has no API key yet.\n\n" +
+  PITCH +
+  "\n\nSet it up (about a minute, no credit card):\n" +
+  "1. Create a free account:\n" +
+  `   ${registerUrl("no_key")}\n` +
+  "2. Create an API key and copy it:\n" +
+  `   ${KEYS_URL}\n` +
+  "3. Add it to this server's entry in your MCP config as the env var QUANTUMPROXIES_API_KEY, then restart the client.\n\n" +
+  "Already made a key? It has to live in the MCP config: the client spawns this process, so a key exported in your shell never reaches it.";
 
 const MISSING_KEY_MESSAGE_HTTP =
-  "No API key on this request. Get one at https://app.quantumproxies.io/api-keys and send it as an Authorization: Bearer <key> header (in Claude, paste the key when you connect this connector). Browsing the tool list needs no key; running a tool does.";
+  "Nothing ran: this request carried no QuantumProxies API key.\n\n" +
+  PITCH +
+  "\n\nSet it up (about a minute, no credit card):\n" +
+  "1. Create a free account:\n" +
+  `   ${registerUrl("no_key")}\n` +
+  "2. Create an API key and copy it:\n" +
+  `   ${KEYS_URL}\n` +
+  "3. Reconnect this connector and paste the key when the client asks — it travels as an " +
+  "Authorization: Bearer <key> header (X-Api-Key works too).\n\n" +
+  "Browsing the tool list needs no key; running a tool does.";
+
+/**
+ * The key was sent but the API turned it down. Same reasoning as above: the
+ * upstream body is one flat sentence ("Invalid API key"), which leaves the user
+ * guessing between four different causes. Name them, then give the one link
+ * that fixes all four.
+ */
+function rejectedKeyMessage(apiMessage: string, transport: Transport): string {
+  const head =
+    `QuantumProxies did not accept this API key — the API answered: ${apiMessage}\n\n` +
+    "Usually one of four things: the key was revoked or regenerated, only part of it was pasted, " +
+    "it expired, or it belongs to another dashboard — QuantumProxies keys start with qp_live_.\n\n" +
+    "A fresh key is one click and works immediately:\n" +
+    `   ${KEYS_URL}`;
+  // Hosted endpoint (reviewed as a ChatGPT plugin): no sign-up pitch in results.
+  if (transport === "http") return head;
+  return (
+    head +
+    "\n\nNo account yet? Signing up is free and every account starts with a free monthly allowance:\n" +
+    `   ${registerUrl("rejected_key")}`
+  );
+}
+
+/** Out of credit mid-run: say where to fix it instead of dead-ending the agent. */
+function outOfCreditMessage(apiMessage: string, transport: Transport): string {
+  if (transport === "http") {
+    // Plugin-directory rule: explain why the call did not run and link an
+    // informational page, never a top-up/checkout page or an upgrade pitch.
+    return (
+      `${apiMessage}\n\n` +
+      "This call did not run because the account balance does not cover it. Prices per call and per result are listed at:\n" +
+      `   ${PRICING_URL}`
+    );
+  }
+  return (
+    `${apiMessage}\n\n` +
+    "Top up and the same call goes straight through — it is pay-as-you-go credit, no subscription, " +
+    "and the free monthly allowance resets on its own:\n" +
+    `   ${BALANCE_URL}`
+  );
+}
 
 export function missingKeyMessage(transport: Transport): string {
   return transport === "http" ? MISSING_KEY_MESSAGE_HTTP : MISSING_KEY_MESSAGE;
 }
+
+// ── Keyless tier (hosted endpoint only) ─────────────────────────────────────
+// Without a key the hosted endpoint relays tool calls to the API as keyless
+// traffic (shared secret + visitor IP); the API serves them from a pool account
+// under limits the admin tunes and answers account_required where an account is
+// needed. These pieces do the selling: the instructions the model reads at
+// initialize, a one-line reminder when the per-minute allowance is nearly gone,
+// and an MCP prompt. No $ figures and no exact counts: they live in the DB.
+
+const KEYLESS_REGISTER_URL = registerUrl("keyless");
+
+const KEYLESS_UPGRADE =
+  "A free account (about a minute, no card) removes the keyless cap and adds browser rendering and " +
+  "screenshots, AI extraction, 70+ ready-made collectors, crawl and batch jobs, and a monthly free " +
+  "allowance that resets on its own: " +
+  KEYLESS_REGISTER_URL;
+
+const KEYLESS_INSTRUCTIONS =
+  "This connection has no QuantumProxies API key, so it runs on the KEYLESS tier: the basic tools only " +
+  "(a page as clean Markdown over plain HTTP, search results, a site map), a small per-IP limit of " +
+  "requests per minute, and no JavaScript rendering. " +
+  "When the user's task needs rendering or screenshots, AI extraction, ready-made collectors, crawl or batch " +
+  "jobs, or more throughput — or a call comes back with 'account_required' or a keyless limit — tell them " +
+  "plainly that a free QuantumProxies account unlocks it in about a minute with no credit card, and give " +
+  "them this link: " +
+  KEYLESS_REGISTER_URL +
+  " Then ask them to paste the API key into this connector (Authorization: Bearer <key>). " +
+  "Say it once, when it matters, not under every answer.";
+
+const CREATE_ACCOUNT_PROMPT =
+  "I am using the QuantumProxies MCP connector without an API key (keyless tier). In a few short " +
+  "paragraphs, tell me concretely what I gain by creating a free account, then walk me through connecting it.\n\n" +
+  "Facts to use, nothing else:\n" +
+  "- Keyless tier: basic tools only (page to Markdown over plain HTTP, search results, site map), a small " +
+  "per-IP limit per minute, no JavaScript rendering, no AI extraction, no collectors.\n" +
+  "- Free account: a monthly free allowance that resets on its own, a higher per-minute limit, browser " +
+  "rendering and screenshots, AI extraction, 70+ ready-made collectors (maps, jobs, marketplaces, e-commerce, " +
+  "public registries), crawl and batch jobs, whole-site map. After the allowance you pay per successful call " +
+  "only — no subscription, no credit card to start.\n" +
+  "- Steps: 1) create the account at " +
+  KEYLESS_REGISTER_URL +
+  " 2) create an API key at " +
+  KEYS_URL +
+  " 3) paste it into this connector as the Authorization: Bearer <key> header (X-Api-Key works too) and reconnect.\n\n" +
+  "End with the register link on its own line.";
 
 export interface BuildOptions {
   /** API key; falls back to QUANTUMPROXIES_API_KEY. Empty = introspection only (tool calls answer 401). */
@@ -38,6 +183,72 @@ export interface BuildOptions {
   apiBase?: string;
   /** Shapes the "no key" instructions. Defaults to stdio (the npm package). */
   transport?: Transport;
+  /**
+   * Chi sta chiamando, quando il transport lo sa già. Serve al transport HTTP,
+   * che è stateless: ogni POST costruisce un server nuovo, quindi
+   * `getClientVersion()` è popolato SOLO sulla richiesta che porta l'initialize
+   * e resta vuoto su tutte le tools/call — che sono proprio quelle che toccano
+   * l'API. remote.ts lo ripesca (corpo dell'initialize o token di sessione) e
+   * lo passa di qui.
+   */
+  clientInfo?: { name?: string; version?: string } | null;
+  /**
+   * Keyless relay (hosted endpoint only): with no key and the shared secret
+   * ANON_ACCESS_TOKEN, tool calls go to the API as keyless traffic. Without the
+   * secret, introspection only and tool calls get the setup message.
+   */
+  anonToken?: string;
+  /** The visitor's IP as the transport saw it — forwarded so the API limits per caller, not per relay. */
+  clientIp?: string;
+  /** How the hosted endpoint authenticated the caller: "oauth" signs the calls so /admin/mcp can count OAuth connections. */
+  auth?: "oauth" | "key";
+  /**
+   * "chatgpt": the ChatGPT app's tool set (remote.ts picks it from the OAuth
+   * client). unlock is limited to public GET/HEAD and the collectors that return data about individuals are not
+   * offered. Anything else: the full server.
+   */
+  profile?: "chatgpt";
+}
+
+/**
+ * Come si firmano le chiamate all'API. Fino al 25/09/2026 non si firmavano
+ * affatto: `fetch` mandava solo Authorization e Content-Type, quindi in
+ * `ApiRequestLog` il traffico MCP arrivava come `node` o null, indistinguibile
+ * da uno script qualsiasi — impossibile dire chi usasse l'MCP e da dove.
+ * La versione la riallinea scripts/sync-version.mjs insieme a quella
+ * dichiarata dall'McpServer; il nome lo brandifica quantic-mcp/sync-from-scraper-mcp.sh.
+ */
+const MCP_UA_BASE = "quantumproxies-mcp/0.11.3";
+/** The version this build declares (kept in step with package.json by scripts/sync-version.mjs). */
+export const MCP_VERSION = MCP_UA_BASE.split("/")[1] ?? "0.0.0";
+/** QP | QD — which brand this build serves (the sync script rebrands the package name). */
+export const BRAND_KEY: "QP" | "QD" = MCP_UA_BASE.startsWith("quanticdata") ? "QD" : "QP";
+
+/** Header value sanitizer: il nome del client arriva da fuori e non deve poter iniettare header. */
+function uaSafe(s: string, max = 40): string {
+  return String(s).replace(/[^A-Za-z0-9._ /-]/g, "").trim().slice(0, max);
+}
+
+/**
+ * Collectors not offered in the ChatGPT app: they return profiles or contact
+ * details of individuals (people, doctors, lead lists), which ChatGPT apps may
+ * not collect. They stay available everywhere else.
+ */
+const CHATGPT_HIDDEN_COLLECTORS = new Set([
+  "linkedin_profile",
+  "instagram_profile",
+  "tiktok_profile",
+  "site_contacts",
+  "bbb_businesses",
+  "healthgrades_doctors",
+  "miodottore_doctors",
+  "local_business_leads",
+  "business_directory",
+  "paginegialle_profiles",
+]);
+const CHATGPT_HIDDEN_CATEGORIES = new Set(["leads"]);
+function hiddenInChatGPT(c: any): boolean {
+  return CHATGPT_HIDDEN_COLLECTORS.has(String(c?.slug)) || CHATGPT_HIDDEN_CATEGORIES.has(String(c?.category ?? "").toLowerCase());
 }
 
 export function buildServer(opts: BuildOptions = {}): McpServer {
@@ -47,10 +258,44 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
   );
   const API_KEY = opts.apiKey ?? (process.env.QUANTUMPROXIES_API_KEY || "");
 
+  /**
+   * `quantumproxies-mcp/0.9.1 (http; client=cursor/1.7.2)`. Il client si sa solo
+   * dopo l'initialize: prima (o su un transport che non lo espone) resta la sola
+   * parte server, che è già abbastanza per separare l'MCP dal resto del traffico.
+   */
+  function userAgent(): string {
+    let client = "";
+    try {
+      // Prima quello che il transport ha già in mano (HTTP stateless), poi
+      // l'handshake di questa connessione (stdio, dove il server vive).
+      const info = opts.clientInfo?.name ? opts.clientInfo : (server as any)?.server?.getClientVersion?.();
+      if (info?.name) client = uaSafe(info.version ? `${info.name}/${info.version}` : info.name);
+    } catch {
+      /* introspezione senza handshake: nessun client da dichiarare */
+    }
+    // "; trial" marca le chiamate senza chiave, "; oauth" quelle entrate col login
+    // OAuth: /admin/mcp le conta a parte (lib/mcpUsage).
+    return `${MCP_UA_BASE} (${opts.transport ?? "stdio"}${client ? `; client=${client}` : ""}${KEYLESS ? "; trial" : ""}${opts.auth === "oauth" ? "; oauth" : ""})`;
+  }
+
+  /** No key, hosted endpoint, secret configured: calls go to the API as keyless traffic. */
+  const KEYLESS = !API_KEY && opts.transport === "http" && Boolean(opts.anonToken);
+  const KEYLESS_MESSAGE = missingKeyMessage(opts.transport ?? "stdio");
+  const CHATGPT = opts.profile === "chatgpt";
+
   interface ApiResult {
     ok: boolean;
     status: number;
     data: any;
+    /** Keyless tier: what the API says is left this minute (X-RateLimit-*). */
+    keyless?: { remaining: number | null; limit: number | null };
+  }
+
+  /** The per-minute counter the API sends on keyless calls; undefined on keyed calls. */
+  function keylessFrom(res: Response): ApiResult["keyless"] {
+    if (!KEYLESS) return undefined;
+    const n = (v: string | null) => (v !== null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null);
+    return { remaining: n(res.headers.get("x-ratelimit-remaining")), limit: n(res.headers.get("x-ratelimit-limit")) };
   }
 
   /**
@@ -88,8 +333,8 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
   }
 
   async function callApi(path: string, body: unknown, method: "POST" | "GET" | "DELETE" = "POST"): Promise<ApiResult> {
-    if (!API_KEY) {
-      return { ok: false, status: 401, data: { message: missingKeyMessage(opts.transport ?? "stdio") } };
+    if (!API_KEY && !KEYLESS) {
+      return { ok: false, status: 401, data: { message: KEYLESS_MESSAGE } };
     }
     const url = `${API_BASE}${path}`;
     let res: Response;
@@ -97,8 +342,20 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       res = await fetch(url, {
         method,
         headers: {
-          Authorization: `Bearer ${API_KEY}`,
+          ...(KEYLESS
+            ? {
+                // Keyless: no Authorization at all — the API recognises the relay
+                // by the shared secret and limits by the visitor's IP.
+                "X-QD-Anon-Token": String(opts.anonToken),
+                ...(opts.clientIp ? { "X-QD-Client-Ip": opts.clientIp } : {}),
+              }
+            : { Authorization: `Bearer ${API_KEY}` }),
           "Content-Type": "application/json",
+          // Chi sta chiamando: l'handshake `initialize` porta nome e versione
+          // del client MCP (claude-ai, Claude Code, cursor, vscode, n8n…) ed è
+          // l'unico punto in cui si sa DOVE gira. Senza questo, /admin/mcp non
+          // può dire né chi usa l'MCP né da dove.
+          "User-Agent": userAgent(),
         },
         body: method === "GET" ? undefined : JSON.stringify(body),
         signal: AbortSignal.timeout(90_000),
@@ -112,8 +369,166 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       // Text payloads (e.g. collector runs exported as CSV) are passed through verbatim.
       const text = await res.text().catch(() => "");
       data = res.ok ? { payload: text } : { message: text || `Non-JSON response (HTTP ${res.status})` };
-      return { ok: res.ok, status: res.status, data };
+      return { ok: res.ok, status: res.status, data, keyless: keylessFrom(res) };
     }
+    try {
+      data = await res.json();
+    } catch {
+      data = { message: `Non-JSON response (HTTP ${res.status})` };
+    }
+    return { ok: res.ok, status: res.status, data, keyless: keylessFrom(res) };
+  }
+
+  /**
+   * Indented JSON reads better in a small answer, but past a few KB the
+   * indentation is pure overhead in the model's context: the full collector
+   * catalog went out at 57 KB pretty-printed, the country list at 20 KB, and
+   * ChatGPT starts struggling well before 100 KB. Large payloads go compact.
+   */
+  const PRETTY_MAX_CHARS = 12_000;
+  function stringifyForModel(value: unknown): string {
+    const pretty = JSON.stringify(value, null, 2);
+    return pretty !== undefined && pretty.length > PRETTY_MAX_CHARS ? JSON.stringify(value) : pretty;
+  }
+
+  /** Rewrite the payload of a successful answer (the envelope stays as the API sent it). */
+  function mapPayload(result: ApiResult, fn: (payload: any) => any): ApiResult {
+    if (!result.ok || !result.data || typeof result.data !== "object") return result;
+    const enveloped = "payload" in result.data;
+    const payload = enveloped ? result.data.payload : result.data;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return result;
+    let next: any;
+    try {
+      next = fn(payload);
+    } catch {
+      return result; // a trim must never cost the caller the answer
+    }
+    return { ...result, data: enveloped ? { ...result.data, payload: next } : next };
+  }
+
+  /**
+   * Append what to do next to a plain API error ("Job not found", "Unknown
+   * collector"): the agent has the one sentence of the error to recover from,
+   * and naming the tool that fixes it saves a guessing round.
+   */
+  function withErrorHint(result: ApiResult, hint: (status: number, message: string) => string | undefined): ApiResult {
+    if (result.ok || result.status === 401 || result.status === 402) return result;
+    const code = result.data?.payload?.code;
+    if (code === "account_required" || code === "anonymous_limit") return result;
+    const message = String(result.data?.message || result.data?.error || "");
+    const extra = hint(result.status, message);
+    if (!extra) return result;
+    const base = (message || `Request failed (HTTP ${result.status})`).replace(/[.\s]+$/, "");
+    return { ...result, data: { ...(result.data ?? {}), message: `${base}. ${extra}` } };
+  }
+
+  /** Where a job's id comes from, and which tool polls it — the start answers say `id`, the poll tools take `jobId`. */
+  function jobStarted(result: ApiResult, pollTool: string): ApiResult {
+    return mapPayload(result, (p) =>
+      typeof p.id === "string" ? { ...p, next: `Poll with ${pollTool} { jobId: "${p.id}" } until status is completed.` } : p
+    );
+  }
+  function jobNotFound(startTool: string) {
+    return (status: number, message: string) =>
+      status === 404 || /not found|invalid .*id/i.test(message)
+        ? `Pass the \`id\` returned by ${startTool} as jobId; ids belong to the account that started the job.`
+        : undefined;
+  }
+
+  /**
+   * A SERP answer carries every block the parser knows (~35 keys), and on a
+   * plain query most are null or []: ads, shopping, flights, weather… plus
+   * `general` repeating `search_parameters` and `related` repeating
+   * `related_searches`. Absent now means "not on this page"; nothing that was
+   * present is dropped.
+   */
+  function isEmptyValue(v: unknown): boolean {
+    if (v === null || v === undefined) return true;
+    if (Array.isArray(v)) return v.length === 0;
+    return typeof v === "object" && Object.keys(v as object).length === 0;
+  }
+  function pruneSerp(p: any): any {
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(p)) {
+      if (isEmptyValue(value)) continue;
+      if (key === "general" && p.search_parameters) continue;
+      if (key === "related" && Array.isArray(p.related_searches) && p.related_searches.length) continue;
+      out[key] = Array.isArray(value)
+        ? value.map((item) =>
+            item && typeof item === "object" && !Array.isArray(item)
+              ? Object.fromEntries(Object.entries(item).filter(([, x]) => !isEmptyValue(x)))
+              : item
+          )
+        : value;
+    }
+    return out;
+  }
+
+  function presetNotFound(status: number, message: string): string | undefined {
+    return status === 404 || /preset not found/i.test(message)
+      ? "Call list_parser_presets for the ids of this account's presets (save_parser_preset creates one)."
+      : undefined;
+  }
+
+  /** Unwrap the API envelope { message, payload } and format for the model. */
+  function toContent(result: ApiResult): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
+    if (!result.ok) {
+      const msg = result.data?.message || result.data?.error || `Request failed (HTTP ${result.status})`;
+      // Keyless refusals already carry the whole explanation (what needs an
+      // account, the register link): relay them as they are.
+      const code = result.data?.payload?.code;
+      if (code === "account_required" || code === "anonymous_limit") {
+        return { content: [{ type: "text", text: msg }], isError: true };
+      }
+      // Auth and credit failures are the two the caller can actually fix, and
+      // the two where a bare upstream string ("Invalid API key") ends the
+      // evaluation. Everything else passes through unchanged.
+      if (result.status === 401) {
+        const text = msg === KEYLESS_MESSAGE ? msg : rejectedKeyMessage(msg, opts.transport ?? "stdio");
+        return { content: [{ type: "text", text }], isError: true };
+      }
+      if (result.status === 402) {
+        return { content: [{ type: "text", text: outOfCreditMessage(msg, opts.transport ?? "stdio") }], isError: true };
+      }
+      return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+    }
+    const payload = result.data?.payload ?? result.data;
+    let text = typeof payload === "string" ? payload : stringifyForModel(payload);
+    // Keyless: the account pitch lives in the server instructions; the result
+    // carries a reminder only when the per-minute allowance is nearly gone.
+    const k = result.keyless;
+    if (k && k.remaining !== null && k.remaining <= 2) {
+      const left = k.limit !== null ? `${k.remaining} of ${k.limit} requests left this minute. ` : "";
+      text += `\n\n— Keyless tier: ${left}${KEYLESS_UPGRADE}`;
+    }
+    return { content: [{ type: "text", text }] };
+  }
+
+  /**
+   * POST /feedback — the one call that works WITHOUT a key. A developer who
+   * hits a bug during the no-key trial, or before they ever made a key, is
+   * exactly who we want to hear from; asking them to sign up first would lose
+   * the report. The key travels when there is one, so the backend can tie the
+   * report to an account; otherwise the backend keeps only a hash of the IP.
+   */
+  async function postFeedback(body: Record<string, unknown>): Promise<ApiResult> {
+    const url = `${API_BASE}/feedback`;
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          ...(API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {}),
+          "Content-Type": "application/json",
+          "User-Agent": userAgent(),
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (err) {
+      throw transportError(err, url);
+    }
+    let data: any = null;
     try {
       data = await res.json();
     } catch {
@@ -122,26 +537,31 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     return { ok: res.ok, status: res.status, data };
   }
 
-  /** Unwrap the API envelope { message, payload } and format for the model. */
-  function toContent(result: ApiResult): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
-    if (!result.ok) {
-      const msg = result.data?.message || result.data?.error || `Request failed (HTTP ${result.status})`;
-      return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
-    }
-    const payload = result.data?.payload ?? result.data;
-    const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
-    return { content: [{ type: "text", text }] };
-  }
-
   // Riallineato da scripts/sync-version.mjs, che `npm run build` esegue sempre:
   // `npm version` non tocca questo file, e il bundle MCPB ha già dichiarato
   // 0.9.0 con package.json a 0.9.1.
-  const server = new McpServer({ name: "quantumproxies", version: "0.9.1" });
+  const server = new McpServer(
+    { name: "quantumproxies", version: "0.11.3" },
+    // Keyless sessions get the tier explained where the model reads it first.
+    KEYLESS ? { instructions: KEYLESS_INSTRUCTIONS } : undefined
+  );
+  // PostHog MCP Analytics (src/analytics.ts): no-op without POSTHOG_PROJECT_TOKEN.
+  instrumentServer(server);
+
+  // Without a key (keyless HTTP, or a stdio install not configured yet) the
+  // client lists one prompt: what a free account adds, with the steps.
+  if (!API_KEY) {
+    server.prompt(
+      "create_free_account",
+      "What a free QuantumProxies account adds over the keyless tier, and how to connect the key",
+      () => ({ messages: [{ role: "user", content: { type: "text", text: CREATE_ACCOUNT_PROMPT } }] })
+    );
+  }
 
   // ── scrape (extract) ────────────────────────────────────────────────────────
   server.tool(
     "scrape",
-    "Scrape a single web page through a residential proxy and return it as clean Markdown (or HTML/text). Uses a real Chrome TLS fingerprint by default and only spins up a headless browser if the page is bot-challenged. Optionally run structured extraction (CSS selectors) or AI extraction (natural-language prompt). Markdown keeps the complete page by default (content_mode 'smart': everything except nav/footer/cookie chrome, with GFM tables and absolutized links); to inspect a page's raw no-JS/SEO fallback use format 'html'.",
+    "Use this when the user wants the content of one web page. Fetches the page from a residential IP and returns it as clean Markdown (or HTML/text). It tries a plain HTTP request with a Chrome-compatible TLS profile first and uses a headless browser only when the page needs JavaScript or the plain request is refused. Optionally runs structured extraction (CSS selectors or a stored preset) or AI extraction (natural-language prompt). Markdown keeps the complete page by default (content_mode 'smart': everything except nav/footer/cookie banners, with GFM tables and absolute links); use format 'html' to inspect the raw no-JS page. Optional browser `actions` (click, type) can submit forms on the target site. Use it only for pages the user is permitted to access.",
     {
       url: z
         .string()
@@ -168,7 +588,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .enum(["auto", "tls", "fetch", "render"])
         .optional()
         .describe(
-          "auto (default): TLS tier, escalate to browser on block. tls: never escalate — exactly what a pure HTTP bot (no JS) sees, right for SEO checks. render: force browser."
+          "auto (default): plain HTTP first, headless browser when the page needs JavaScript or the HTTP request is refused. tls: plain HTTP only, never a browser — what a crawler without JavaScript sees, right for SEO checks. render: always use the browser."
         ),
       render: z.boolean().optional().describe("Force the headless browser (JS execution)"),
       mode: z
@@ -306,11 +726,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       cookies: z
         .record(z.string())
         .optional()
-        .describe("Cookies to send as name→value — the simple way to scrape behind a login"),
+        .describe("Cookies to send with the request as name→value (e.g. a consent or locale cookie). Only send cookies the user provided for this site."),
     },
     {
       title: "Scrape a web page",
-      readOnlyHint: true,
+      readOnlyHint: false,
+      destructiveHint: true,
       openWorldHint: true,
     },
     async (args) => {
@@ -335,10 +756,169 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     }
   );
 
+  // ── unlock (Web Unlocker) ───────────────────────────────────────────────────
+  // A binary body (PNG render, PDF, image) rides in `bodyBase64`; past this size
+  // it is dropped from the model's context and replaced with a note. A textual
+  // `body` is kept whatever its size, like scrape's Markdown.
+  const UNLOCK_BASE64_MAX = 200 * 1024;
+  const UNLOCK_ALIASES: Record<string, string> = {
+    session_id: "sessionId",
+    tls_profile: "tlsProfile",
+    auto_render: "autoRender",
+    keep_headers: "keepHeaders",
+    success_status_codes: "successStatusCodes",
+    timeout_ms: "timeoutMs",
+    fail_on_block: "failOnBlock",
+    wait_for_selector: "waitForSelector",
+    wait_ms: "waitMs",
+    return_cookies: "returnCookies",
+  };
+  const unlockFull = {
+      url: z.string().url().describe("Target URL"),
+      method: z
+        .enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"])
+        .optional()
+        .describe("HTTP method (default GET). Only GET/HEAD are retried and escalated: any other method gets exactly one attempt."),
+      headers: z
+        .record(z.string())
+        .optional()
+        .describe(
+          "Headers your own client would send. Browser identity headers (User-Agent, Accept, Sec-Fetch-*) are set to match the TLS profile unless keep_headers is set; auth, cookie, content-type and custom headers are forwarded as given."
+        ),
+      body: z.string().optional().describe("Request body as a UTF-8 string (JSON, form data, …)"),
+      country: z.string().length(2).optional().describe("ISO country code for the proxy exit, e.g. 'us'"),
+      session_id: z
+        .string()
+        .max(64)
+        .optional()
+        .describe("Sticky session id — reuse it across calls to keep the same exit IP"),
+      tls_profile: z
+        .enum(["chrome", "firefox", "safari", "safari_ios", "edge", "brave", "mobile"])
+        .optional()
+        .describe("Browser TLS profile for the connection (default chrome)"),
+      tier: z
+        .enum(["premium", "mobile"])
+        .optional()
+        .describe("Exit network: premium (default, residential) or mobile. Each tier bills its own prepaid unlocker balance."),
+      render: z
+        .enum(["html", "png"])
+        .optional()
+        .describe("Run the page in a headless browser instead of the TLS tier (GET only): 'html' returns the rendered DOM, 'png' a screenshot in bodyBase64"),
+      auto_render: z
+        .boolean()
+        .optional()
+        .describe("false: never retry a refused GET in the headless browser (default true)"),
+      keep_headers: z
+        .boolean()
+        .optional()
+        .describe("Send your own identity headers verbatim instead of the fingerprint's"),
+      success_status_codes: z
+        .array(z.number().int().min(100).max(599))
+        .max(20)
+        .optional()
+        .describe("Origin statuses to accept as success: never treated as a block, never retried, relayed as-is (e.g. [404])"),
+      timeout_ms: z
+        .number()
+        .int()
+        .min(1000)
+        .max(120_000)
+        .optional()
+        .describe("Per-attempt timeout at the target, in ms"),
+      fail_on_block: z
+        .boolean()
+        .optional()
+        .describe("true: a request the site still refuses is returned as an error (HTTP 502) instead of a 200 payload with blocked: true"),
+      wait_for_selector: z
+        .string()
+        .max(500)
+        .optional()
+        .describe("With render: wait for this CSS selector before capturing the page"),
+      wait_ms: z
+        .number()
+        .int()
+        .min(0)
+        .max(15_000)
+        .optional()
+        .describe("With render: extra wait after load, in ms"),
+      return_cookies: z
+        .boolean()
+        .optional()
+        .describe("Return the cookies set by the origin as name→value in payload.cookies"),
+      cookies: z
+        .record(z.string())
+        .optional()
+        .describe("Cookies to send as name→value (e.g. a consent cookie). Only send cookies the user provided for this site."),
+    };
+  // ChatGPT app: public pages only. No method that writes, no user-supplied
+  // headers or cookies, no fingerprint options.
+  const unlockPublic = {
+    url: unlockFull.url,
+    method: z.enum(["GET", "HEAD"]).optional().describe("HTTP method (default GET)"),
+    country: unlockFull.country,
+    tier: unlockFull.tier,
+    render: unlockFull.render,
+    success_status_codes: unlockFull.success_status_codes,
+    timeout_ms: unlockFull.timeout_ms,
+    wait_for_selector: unlockFull.wait_for_selector,
+    wait_ms: unlockFull.wait_ms,
+  };
+  server.tool(
+    "unlock",
+    CHATGPT
+      ? "Use this when the user needs a public page or public JSON endpoint exactly as the server returns it (status, headers, body, finalUrl) rather than scrape's Markdown, or a rendered HTML snapshot or screenshot of a public page. GET and HEAD only; it does not forward the user's logins, cookies or custom headers, so it works only on content that is publicly accessible. If the site does not return the page, the result says so (`blocked`, with the reason) instead of reporting a success; captchas are never solved. Use it only for sites and data the user is permitted to access."
+      : "Use this when the user needs a site's raw HTTP response (a JSON API, a form POST, a page exactly as served) rather than scrape's Markdown. Sends the request (method, headers, body) from a residential IP with a browser-compatible TLS profile and returns status, headers, body (bodyBase64 for binary) and finalUrl. A GET or HEAD the site refuses is retried from another IP and, for GET, once in a headless browser; other methods get exactly one attempt. If the site still refuses, the response is marked `blocked` with the reason (`blockClass`, `vendor`) instead of being reported as a success; captchas are never solved. POST, PUT, PATCH and DELETE can change or delete data on the target site. Use it only for sites and data the user is permitted to access.",
+    (CHATGPT ? unlockPublic : unlockFull) as typeof unlockFull,
+    CHATGPT
+      ? { title: "Fetch a public page as served", readOnlyHint: false, destructiveHint: false, openWorldHint: true }
+      : { title: "Send a raw HTTP request", readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    async (args: Record<string, unknown>) => {
+      const body: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(args as Record<string, unknown>)) {
+        if (value === undefined) continue;
+        body[UNLOCK_ALIASES[key] ?? key] = value;
+      }
+      const result = await callApi("/scraper/unlock", body);
+      // The unlocker is a prepaid per-GB product with its own balance per tier,
+      // not the pay-as-you-go API credit: the generic 402 text ("top up your
+      // balance, the free allowance resets") sent people to the wrong page.
+      if (result.status === 402 && result.data?.payload?.tier) {
+        const msg = result.data?.message || "Web Unlocker bandwidth exhausted.";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `${msg}\n\nThe Web Unlocker spends its own prepaid GB (one balance per tier: premium, mobile), ` +
+                "separate from the pay-as-you-go API credit that scrape and search use — scrape is the alternative " +
+                "that works on that credit. " +
+                (opts.transport === "http"
+                  ? // Plugin-directory rule: informational page only, no purchase link.
+                    `Unlocker prices are listed at:\n   ${PRICING_URL}`
+                  : `Unlocker GB are bought here:\n   ${UNLOCK_URL}`),
+            },
+          ],
+          isError: true,
+        };
+      }
+      const payload = result.ok ? result.data?.payload : undefined;
+      if (
+        payload &&
+        typeof payload === "object" &&
+        typeof payload.bodyBase64 === "string" &&
+        payload.bodyBase64.length > UNLOCK_BASE64_MAX &&
+        typeof payload.body !== "string"
+      ) {
+        const bytes = Math.floor((payload.bodyBase64.length * 3) / 4);
+        payload.bodyBase64 = `binary body omitted (${bytes} bytes) — call the REST endpoint POST /scraper/unlock directly to download it`;
+      }
+      return toContent(result);
+    }
+  );
+
   // ── generate_parser ─────────────────────────────────────────────────────────
   server.tool(
     "generate_parser",
-    "Look at a page ONCE with an LLM and get back CSS selectors that extract the fields you asked for. Pass the returned `parser` as the `extract` argument on every later scrape of that same layout and no AI runs again — it becomes a plain, free, deterministic extraction. Use this instead of ai_prompt whenever you will scrape more than a couple of pages of the same shape. Every selector is run against the page before being returned, so `report`/`coverage` tell you which fields are actually reliable.",
+    "Look at a page ONCE with an LLM and get back CSS selectors that extract the fields you asked for. Pass the returned `parser` as the `extract` argument on every later scrape of that same layout and no AI runs again — it becomes a plain, deterministic extraction with no AI cost. Use this instead of ai_prompt whenever you will scrape more than a couple of pages of the same shape. Every selector is run against the page before being returned, so `report`/`coverage` tell you which fields are actually reliable.",
     {
       url: z.string().url().optional().describe("The page to learn the layout from"),
       html: z
@@ -364,6 +944,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Generate a parser",
       readOnlyHint: true,
+      destructiveHint: false,
       openWorldHint: true,
     },
     async (args) => toContent(await callApi("/scraper/parser/generate", args))
@@ -374,7 +955,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     "save_parser_preset",
     "Store a generated parser under a name so it can be reused by id. Scrape later with scrape's `preset_id` instead of repeating the selectors, and every run is scored per field — when the recent success rate decays (the site redesigned), the preset regenerates itself from `source_url` and bumps a version. Give it a source_url whenever you can: without one it can never self-heal.",
     {
-      name: z.string().max(120).describe("A name you'll recognise, e.g. 'amazon product page'"),
+      name: z.string().max(120).describe("A name you'll recognise, e.g. 'shop product page'"),
       parser: z
         .record(z.any())
         .describe("The parser to store — normally the `parser` object returned by generate_parser"),
@@ -416,6 +997,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "List parser presets",
       readOnlyHint: true,
+      destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
     },
@@ -429,11 +1011,12 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Parser preset health",
       readOnlyHint: true,
+      destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
     },
     async ({ preset_id }) =>
-      toContent(await callApi(`/scraper/parser/presets/${encodeURIComponent(preset_id)}/stats`, null, "GET"))
+      toContent(withErrorHint(await callApi(`/scraper/parser/presets/${encodeURIComponent(preset_id)}/stats`, null, "GET"), presetNotFound))
   );
 
   server.tool(
@@ -441,16 +1024,16 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     "Regenerate a preset's selectors now (the manual trigger for the automatic repair). Refetches the source page and adopts new selectors ONLY if they extract more than the current ones — a heal that finds nothing better leaves the preset untouched and is not billed.",
     {
       preset_id: z.string().describe("The preset id"),
-      force: z.boolean().optional().describe("Bypass the cooldown between heals"),
+      force: z.boolean().optional().describe("Skip the cooldown between heals"),
     },
     {
       title: "Repair a parser preset",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       openWorldHint: true,
     },
     async ({ preset_id, force }) =>
-      toContent(await callApi(`/scraper/parser/presets/${encodeURIComponent(preset_id)}/heal`, { force }))
+      toContent(withErrorHint(await callApi(`/scraper/parser/presets/${encodeURIComponent(preset_id)}/heal`, { force }), presetNotFound))
   );
 
   // ── seo_audit ───────────────────────────────────────────────────────────────
@@ -468,9 +1051,73 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Audit a page for SEO",
       readOnlyHint: true,
+      destructiveHint: false,
       openWorldHint: true,
     },
     async (args) => toContent(await callApi("/scraper/seo-audit", args))
+  );
+
+  // ── ai_visibility ───────────────────────────────────────────────────────────
+  server.tool(
+    "ai_visibility",
+    "Use this when the user asks whether AI assistants (ChatGPT, Claude, Perplexity, Google AI Overview, Bing Copilot) can find, read and cite a page; use seo_audit for classic Google indexing questions. On-page pass (always): the live robots.txt resolved for 24 AI crawlers per RFC 9309 with the deciding line, Content-Signal, one request sent with the GPTBot user-agent to check whether the site answers AI crawlers differently (skip it with no_bot_fetch), noindex/nosnippet/noai/data-nosnippet, text present without JavaScript, JSON-LD types and resolvable Organization/Person entities, heading outline, question-shaped headings, answer-first paragraph, lists/tables, numeric facts and quotes, chunk-sized sections, dateModified with age, author, outbound sources. Also readability grade, paragraph length, definitional openers, named-entity density, keyword stuffing, first-hand content, images/video, paywall and retired robots tokens. Retrievability: where Google ranks the page for its own H1 question and whether it is indexed (2 SERPs); a page that is not indexed is reported as a blocker. Google AI Overview and Bing Copilot report brand mentions only, because their no-JS results expose no sources. Returns a 0-100 score per pillar (retrievability, access, readability, structure, answerability, trust, plus offsite when requested), blockers that cap the score, every check with evidence and fix, and topFixes. Citation panel (when `queries` is set): asks each engine the questions and reports cited / mentioned / rank per (query × engine), share of voice across all cited domains, and the domains cited where the page is absent.",
+    {
+      url: z.string().url().describe("The page URL to audit"),
+      queries: z
+        .array(z.string().min(1).max(300))
+        .max(10)
+        .optional()
+        .describe("Questions to ask the AI engines (max 10). Omit for the on-page audit only — each (query × engine) pair is a billed engine call."),
+      engines: z
+        .array(z.enum(["perplexity", "openai", "anthropic", "aio", "copilot", "deepseek"]))
+        .optional()
+        .describe("Engines to ask (default: all). aio = Google AI Overview read from a live SERP, copilot = Bing's generative answer, openai/anthropic = the vendors' APIs with web search (an approximation of ChatGPT/Claude search), deepseek = our own Google top-10 handed to DeepSeek to answer and cite (cheapest; measures whether a model picks your page from the same results)."),
+      competitors: z
+        .array(z.string().min(1).max(253))
+        .max(20)
+        .optional()
+        .describe("Competitor domains to flag in the share of voice, e.g. ['example.com']"),
+      brand: z
+        .string()
+        .max(80)
+        .optional()
+        .describe("Brand name to look for in the answer text ('mentioned' even when not cited). Defaults to the page's og:site_name / Organization name."),
+      country: z.string().length(2).optional().describe("ISO country code for the proxy exit, e.g. 'us' — also the locale of the AI Overview / Copilot SERP"),
+      no_render: z.boolean().optional().describe("Skip the rendered pass (cheaper — the two JS-parity checks are reported as skipped)"),
+      no_bot_fetch: z.boolean().optional().describe("Skip the extra request sent with the GPTBot user-agent"),
+      no_retrieval: z.boolean().optional().describe("Skip the retrievability probe (2 SERPs: Google rank of the page for its own H1 question, and whether it is indexed). On by default; a page that is not indexed is reported as a blocker."),
+      offsite: z
+        .boolean()
+        .optional()
+        .describe("Also measure mentions of the brand off the page with five searches (\"brand\" site:youtube.com / reddit.com / wikipedia.org / linkedin.com / review sites). Adds an `offsite` pillar; billed as 5 SERP calls."),
+    },
+    {
+      title: "Audit a page for AI visibility",
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: true,
+    },
+    async (args) =>
+      // access.bots lists all 24 crawlers with company, impact and rule — about
+      // 6 KB that says "allowed, no rule" 24 times on most sites. Keep in full
+      // only the bots a rule actually decides (blocked or explicitly allowed);
+      // the verdict for the others is one line of names.
+      toContent(
+        mapPayload(await callApi("/scraper/ai-visibility", args), (p) => {
+          const bots = p?.access?.bots;
+          if (!Array.isArray(bots)) return p;
+          const decided = bots.filter((b: any) => b && (b.allowed === false || b.rule));
+          const open = bots.filter((b: any) => b && b.allowed !== false && !b.rule).map((b: any) => b.agent);
+          return {
+            ...p,
+            access: {
+              ...p.access,
+              bots: decided,
+              ...(open.length ? { botsAllowedByDefault: open } : {}),
+            },
+          };
+        })
+      )
   );
 
   // ── search (serp) ───────────────────────────────────────────────────────────
@@ -539,12 +1186,16 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
         .record(z.union([z.string(), z.number()]))
         .optional()
         .describe("Additional Google query parameters not modeled above"),
-      place_id: z.string().optional().describe("Google Maps place id (from maps/places results) for place_details"),
+      place_id: z.string().optional().describe("Google Maps place id for place_details — the hex '0x…:0x…' fid from maps/places results, a 'ChIJ…' place id or a numeric cid all work; served from Maps' place card over HTTP (name, address, phone, website, rating, reviews, category, weekly hours, open state) in about a second"),
       data_id: z
         .string()
         .optional()
         .describe("Maps data id, hex fid '0x…:0x…' (from maps/place_details results) — required for reviews"),
-      product_id: z.string().optional().describe("Google Shopping product id for product details"),
+      product_ids: z
+        .boolean()
+        .optional()
+        .describe("shopping only: render the Shopping grid so each result carries product_id/offer_id (the input of search_type=product). Costs a render; the default no-JS shopping page has no ids."),
+      product_id: z.string().optional().describe("Google Shopping product id (the product_id of a shopping result — the rendered grid carries it) for search_type=product: the seller list with price, old price, discount, stock and delivery per merchant. Without it, pass a query and the first product is opened."),
       departure_id: z.string().optional().describe("Flights: departure airport IATA code, e.g. 'JFK'"),
       arrival_id: z.string().optional().describe("Flights: arrival airport IATA code, e.g. 'LAX'"),
       outbound_date: z.string().optional().describe("Flights: outbound date YYYY-MM-DD"),
@@ -579,14 +1230,15 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       next_page_token: z
         .string()
         .optional()
-        .describe("Reviews: continuation token from the previous response's serpapi_pagination"),
+        .describe("Reviews: the next_page_token from the previous reviews response's pagination block"),
     },
     {
       title: "Search the web",
       readOnlyHint: true,
+      destructiveHint: false,
       openWorldHint: true,
     },
-    async (args) => toContent(await callApi("/scraper/serp", args))
+    async (args) => toContent(mapPayload(await callApi("/scraper/serp", args), pruneSerp))
   );
 
   // ── search_and_read (SERP → citation-ready AI context) ─────────────────────
@@ -620,9 +1272,32 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Search and read results",
       readOnlyHint: true,
+      destructiveHint: false,
       openWorldHint: true,
     },
-    async (args) => toContent(await callApi("/ai/search", args))
+    async (args) =>
+      // Every fetched page used to travel twice: once in sources[n].content and
+      // again, verbatim, inside `context` under its [n] marker — double the
+      // tokens for the same text. `context` is the part meant for the model, so
+      // sources keep the citation fields and drop the copy (and the raw JSON-LD).
+      toContent(
+        mapPayload(await callApi("/ai/search", args), (p) => {
+          if (typeof p.context !== "string" || !p.context || !Array.isArray(p.sources)) return p;
+          return {
+            ...p,
+            sources: p.sources.map((s: any) => {
+              if (!s || typeof s !== "object") return s;
+              const { content: _content, ...rest } = s;
+              if (rest.metadata && typeof rest.metadata === "object") {
+                const { jsonLd: _jsonLd, ...meta } = rest.metadata;
+                rest.metadata = meta;
+              }
+              return rest;
+            }),
+            note: "Each source's page text is in `context`, under the same [n] number as its `position`.",
+          };
+        })
+      )
   );
 
   // ── map (URL discovery) ─────────────────────────────────────────────────────
@@ -651,6 +1326,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Map a site's URLs",
       readOnlyHint: true,
+      destructiveHint: false,
       openWorldHint: true,
     },
     async (args) => toContent(await callApi("/scraper/map", args))
@@ -674,10 +1350,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     },
     {
       title: "Crawl a site",
-      readOnlyHint: true,
+      readOnlyHint: false,
+      destructiveHint: false,
       openWorldHint: true,
     },
-    async (args) => toContent(await callApi("/scraper/crawl", args))
+    async (args) => toContent(jobStarted(await callApi("/scraper/crawl", args), "crawl_status"))
   );
 
   server.tool(
@@ -699,6 +1376,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Crawl status",
       readOnlyHint: true,
+      destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
     },
@@ -710,7 +1388,10 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       query.set("include_content", include_content ? "true" : "false");
       const qs = query.toString();
       return toContent(
-        await callApi(`/scraper/crawl/${encodeURIComponent(jobId)}${qs ? `?${qs}` : ""}`, null, "GET")
+        withErrorHint(
+          await callApi(`/scraper/crawl/${encodeURIComponent(jobId)}${qs ? `?${qs}` : ""}`, null, "GET"),
+          jobNotFound("crawl")
+        )
       );
     }
   );
@@ -735,10 +1416,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     },
     {
       title: "Scrape URLs in batch",
-      readOnlyHint: true,
+      readOnlyHint: false,
+      destructiveHint: false,
       openWorldHint: true,
     },
-    async (args) => toContent(await callApi("/scraper/batch", args))
+    async (args) => toContent(jobStarted(await callApi("/scraper/batch", args), "batch_status"))
   );
 
   server.tool(
@@ -760,6 +1442,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Batch status",
       readOnlyHint: true,
+      destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
     },
@@ -769,7 +1452,10 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       if (include_content) query.set("include_content", "true");
       const qs = query.toString();
       return toContent(
-        await callApi(`/scraper/batch/${encodeURIComponent(jobId)}${qs ? `?${qs}` : ""}`, null, "GET")
+        withErrorHint(
+          await callApi(`/scraper/batch/${encodeURIComponent(jobId)}${qs ? `?${qs}` : ""}`, null, "GET"),
+          jobNotFound("batch")
+        )
       );
     }
   );
@@ -810,10 +1496,11 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     },
     {
       title: "Bulk search",
-      readOnlyHint: true,
+      readOnlyHint: false,
+      destructiveHint: true,
       openWorldHint: true,
     },
-    async (args) => toContent(await callApi("/scraper/serp/bulk", args))
+    async (args) => toContent(jobStarted(await callApi("/scraper/serp/bulk", args), "search_bulk_status"))
   );
 
   server.tool(
@@ -831,6 +1518,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Bulk search status",
       readOnlyHint: true,
+      destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
     },
@@ -839,7 +1527,13 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       if (since !== undefined) query.set("since", String(since));
       const qs = query.toString();
       return toContent(
-        await callApi(`/scraper/serp/bulk/${encodeURIComponent(jobId)}${qs ? `?${qs}` : ""}`, null, "GET")
+        mapPayload(
+          withErrorHint(
+            await callApi(`/scraper/serp/bulk/${encodeURIComponent(jobId)}${qs ? `?${qs}` : ""}`, null, "GET"),
+            jobNotFound("search_bulk")
+          ),
+          pruneSerp
+        )
       );
     }
   );
@@ -882,10 +1576,10 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Build a dataset",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       openWorldHint: true,
     },
-    async (args) => toContent(await callApi("/scraper/datasets", args))
+    async (args) => toContent(jobStarted(await callApi("/scraper/datasets", args), "dataset_status"))
   );
 
   server.tool(
@@ -904,6 +1598,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Dataset status",
       readOnlyHint: true,
+      destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
     },
@@ -913,7 +1608,10 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       if (mode) query.set("mode", mode);
       const qs = query.toString();
       return toContent(
-        await callApi(`/scraper/datasets/${encodeURIComponent(jobId)}${qs ? `?${qs}` : ""}`, null, "GET")
+        withErrorHint(
+          await callApi(`/scraper/datasets/${encodeURIComponent(jobId)}${qs ? `?${qs}` : ""}`, null, "GET"),
+          jobNotFound("create_dataset")
+        )
       );
     }
   );
@@ -933,7 +1631,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
 
   server.tool(
     "list_proxies",
-    "List the account's proxy services of every type — Residential Basic/Premium/Private, Mobile, Mobile V2, Datacenter (static or traffic-based), ISP, IPv6 — with plan type, bandwidth left, expiry, whitelisted IPs and the orderId to pass to generate_proxies. Call this first to see which proxy plans are available.",
+    "List the account's proxy services of every type — Residential Basic/Premium/Private, Mobile, Mobile V2, Datacenter (static or traffic-based), ISP, IPv6 — with plan type, bandwidth left, expiry, whitelisted IPs and the orderId to pass to generate_proxies. Passwords are not listed here: generate_proxies returns ready-to-use credentials. Call this first to see which proxy plans are available.",
     {
       active: z
         .boolean()
@@ -946,6 +1644,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "List proxy services",
       readOnlyHint: true,
+      destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
     },
@@ -956,7 +1655,32 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       if (limit !== undefined) query.set("limit", String(limit));
       if (offset !== undefined) query.set("offset", String(offset));
       const qs = query.toString();
-      return toContent(await callApi(`/public/proxies${qs ? `?${qs}` : ""}`, null, "GET"));
+      // A listing is not where credentials belong: the API row carries each
+      // service's proxy password, and a list tool gets called casually, logged,
+      // and pasted into chats. generate_proxies is the one tool that hands out
+      // working credentials (the user asks for them there). The unit-less twins
+      // of the *GB fields and `expiry` (= expiresAt) go too when they are equal.
+      return toContent(
+        mapPayload(await callApi(`/public/proxies${qs ? `?${qs}` : ""}`, null, "GET"), (p) => {
+          if (!Array.isArray(p.proxies)) return p;
+          return {
+            ...p,
+            proxies: p.proxies.map((row: any) => {
+              if (!row || typeof row !== "object") return row;
+              const { password, ...rest } = row;
+              for (const [dup, twin] of [
+                ["bandwidth", "bandwidthGB"],
+                ["bandwidthLeft", "bandwidthLeftGB"],
+                ["bandwidthUsed", "bandwidthUsedGB"],
+                ["expiry", "expiresAt"],
+              ] as const) {
+                if (dup in rest && twin in rest && rest[dup] === rest[twin]) delete rest[dup];
+              }
+              return password ? { ...rest, password: "hidden: call generate_proxies with this orderId for ready-to-use credentials" } : rest;
+            }),
+          };
+        })
+      );
     }
   );
 
@@ -1033,6 +1757,7 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Proxy locations",
       readOnlyHint: true,
+      destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
     },
@@ -1046,6 +1771,17 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
               ? "/public/generator/mobile/targeting-options"
               : "/public/generator/datacenter/targeting-options";
         return toContent(await callApi(path, null, "GET"));
+      }
+      if ((lvl === "states" || lvl === "cities") && !country) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: level '${lvl}' needs \`country\` (a code from level 'countries', e.g. 'us').`,
+            },
+          ],
+          isError: true,
+        };
       }
       const query = new URLSearchParams({ planType });
       if (country) query.set("country", country);
@@ -1096,19 +1832,66 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
   // ── Collectors (ready-made scrapers: semantic input, results priced per row) ─
   server.tool(
     "list_collectors",
-    "List the ready-made Collectors: paid, versioned scrapers you run with a semantic input (keyword + location, place id, product id, domain…) instead of URLs — e.g. web_search, search_images, search_videos, keyword_ideas, amazon_search, amazon_product, ebay_search, aliexpress_search, linkedin_jobs, indeed_jobs, reddit_posts, youtube_search, youtube_channel, instagram_profile, tiktok_profile, tiktok_video, linkedin_profile, linkedin_company, zillow_search, zillow_property, app_store_apps, app_store_reviews, google_play_apps, google_maps_places, place_reviews, google_jobs, google_news, google_shopping, product_offers, hotels, google_flights, google_events, google_trends, google_autocomplete, google_lens, youtube_video, ebay_product, flipkart_search, idealista_search, kleinanzeigen_search, autotrader_search, github_repos, hacker_news, coingecko_coins, wikipedia_articles, yahoo_finance, stackoverflow, steam, npm_packages, sec_filings, defillama, wayback_machine, clinical_trials, certificate_transparency, wikidata, nvd_cve, openfda, openalex, pypi_packages, exchange_rates, gleif_lei, docker_hub, crates_io, world_bank, openlibrary_books, arxiv_papers, weather_forecast, whois_domain, dns_records, itunes_search, local_business_leads, site_contacts, company_profile, business_directory. Returns each collector's slug, input/output schema, example input, price per delivered result and current health. Billing is pay-per-success: only delivered rows are charged.",
+    "Use this to find a ready-made Collector for a task before calling run_collector. Collectors are paid, versioned scrapers you run with a semantic input (keyword + location, place id, product id, domain…) instead of URLs, grouped in categories such as local businesses and maps, e-commerce, jobs, news, travel, finance, developer registries, research, classifieds, public records and domain/DNS data. Returns a compact catalog (slug, name, category, tagline, price per delivered result, required input fields, health), optionally filtered by `category`; pass `slug` to get one collector's full input/output schema and example input. Billing is pay-per-success: only delivered rows are charged.",
     {
       category: z.string().max(40).optional().describe("Optional category filter (e.g. 'local', 'ecommerce', 'jobs', 'news', 'travel', 'leads', 'finance', 'dev', 'gaming', 'osint', 'research', 'classifieds', 'knowledge')"),
+      slug: z.string().max(80).optional().describe("Return ONE collector's full definition (input and output schema, example input, price, health) instead of the compact catalog"),
     },
     {
       title: "List collectors",
       readOnlyHint: true,
+      destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
     },
-    async ({ category }) => {
-      const qs = category ? `?category=${encodeURIComponent(category)}` : "";
-      return toContent(await callApi(`/scraper/collectors${qs}`, null, "GET"));
+    async ({ category, slug }) => {
+      // The API returns the whole catalog, every collector with its full input
+      // and output schema and examples (~650 KB for 100+ collectors), and does
+      // not filter by category. Sent as is, that blows any client's context and
+      // fails in ChatGPT. So: a compact catalog here, and the full definition of
+      // ONE collector on request, which is what run_collector actually needs.
+      const res = await callApi(`/scraper/collectors`, null, "GET");
+      if (!res.ok) return toContent(res);
+      const payload: any = res.data?.payload ?? res.data;
+      const catalog: any[] = Array.isArray(payload?.collectors) ? payload.collectors : Array.isArray(payload) ? payload : [];
+      const all = CHATGPT ? catalog.filter((c) => !hiddenInChatGPT(c)) : catalog;
+      const answer = (value: unknown) => toContent({ ...res, data: { payload: value } });
+      if (slug) {
+        const one = all.find((c) => c?.slug === slug);
+        if (!one) {
+          return {
+            content: [{ type: "text" as const, text: `No collector with slug '${slug}'. Call list_collectors without slug for the catalog.` }],
+            isError: true,
+          };
+        }
+        return answer({ collector: one, billing: payload?.billing });
+      }
+      const wanted = category?.trim().toLowerCase();
+      const matches = wanted
+        ? all.filter((c) => String(c?.category ?? "").toLowerCase() === wanted || String(c?.category_label ?? "").toLowerCase() === wanted)
+        : all;
+      const byCategory: Record<string, number> = {};
+      for (const c of all) byCategory[c?.category ?? "other"] = (byCategory[c?.category ?? "other"] ?? 0) + 1;
+      if (wanted && matches.length === 0) {
+        return answer({ count: 0, category, available_categories: byCategory });
+      }
+      return answer({
+        count: matches.length,
+        ...(wanted ? { category } : { categories: byCategory }),
+        collectors: matches.map((c) => ({
+          slug: c.slug,
+          name: c.name,
+          category: c.category,
+          tagline: c.tagline,
+          unit: c.unit,
+          price_per_result_usd: c.price?.your_usd ?? c.price?.list_usd ?? null,
+          max_results: c.max_results,
+          required_input: c.input_schema?.required ?? [],
+          input_fields: Object.keys(c.input_schema?.properties ?? {}),
+          health: c.health?.status ?? null,
+        })),
+        next: "Call list_collectors with `slug` for the full input and output schema and an example input before run_collector.",
+      });
     }
   );
 
@@ -1126,8 +1909,25 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
       destructiveHint: false,
       openWorldHint: true,
     },
-    async ({ slug, input, async: asyncRun }) =>
-      toContent(await callApi(`/scraper/collectors/${encodeURIComponent(slug)}/run`, { ...input, ...(asyncRun ? { async: true } : {}) }))
+    async ({ slug, input, async: asyncRun }) => {
+      if (CHATGPT && CHATGPT_HIDDEN_COLLECTORS.has(slug)) {
+        return {
+          content: [{ type: "text" as const, text: `The collector '${slug}' is not available in this app. Call list_collectors for the ones that are.` }],
+          isError: true,
+        };
+      }
+      return toContent(
+        withErrorHint(
+          await callApi(`/scraper/collectors/${encodeURIComponent(slug)}/run`, { ...input, ...(asyncRun ? { async: true } : {}) }),
+          (_status, message) =>
+            /unknown collector/i.test(message)
+              ? "Call list_collectors for the valid slugs."
+              : /invalid input/i.test(message)
+                ? `Call list_collectors with slug "${slug}" for its input schema and an example input.`
+                : undefined
+        )
+      );
+    }
   );
 
   server.tool(
@@ -1140,12 +1940,85 @@ export function buildServer(opts: BuildOptions = {}): McpServer {
     {
       title: "Collector run status",
       readOnlyHint: true,
+      destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
     },
     async ({ run_id, format }) => {
       const qs = format === "csv" ? "?format=csv" : "";
-      return toContent(await callApi(`/scraper/collectors/runs/${encodeURIComponent(run_id)}${qs}`, null, "GET"));
+      return toContent(
+        withErrorHint(await callApi(`/scraper/collectors/runs/${encodeURIComponent(run_id)}${qs}`, null, "GET"), (status, message) =>
+          status === 404 || /not found|invalid run id/i.test(message)
+            ? "Pass the run_id that run_collector returned (runs are visible only to the account that started them)."
+            : undefined
+        )
+      );
+    }
+  );
+
+  // ── report ──────────────────────────────────────────────────────────────────
+  // The feedback channel. Agents hit the edges of a product long before a human
+  // writes to support: a selector that returns nothing, a collector that misses
+  // a field, a tool that is missing. This is the one tool that runs with or
+  // without a key, so a trial user can report what stopped them.
+  server.tool(
+    "report",
+    "Send feedback to the QuantumProxies team: a bug (a result that is wrong or empty after a retry, a broken parser, a blocked page that should work), a missing tool, site, option or collector, or a question about behaviour or pricing. Use it when the user asks to report something. When a tool here clearly failed at its job, or the user needs something no tool here covers, offer to send a report and call it only if the user agrees. Do NOT call it for a missing, rejected or unset API key, for the no-key trial or the balance being used up, for a network timeout, or for your own wrong input: those are fixed by the user, not by the team, and the tool that failed already said how. One report per issue, never one per retry. The report (the fields below, plus the account it comes from when the call is authenticated) is stored and forwarded to the QuantumProxies support team; it cannot be recalled. Works without an API key.",
+    {
+      kind: z
+        .enum(["bug", "feature", "question", "other"])
+        .describe("bug: something returned wrong/empty/errored. feature: a missing tool, option, site or collector. question: unclear behaviour or pricing. other: anything else."),
+      message: z
+        .string()
+        .min(10)
+        .max(4000)
+        .describe("What happened or what is missing, in plain words. Include the URL/query/collector involved when there is one."),
+      tool: z.string().max(64).optional().describe("Name of the tool involved, e.g. 'scrape' or 'run_collector' (omit for general feedback)"),
+      expected: z.string().max(2000).optional().describe("What the user needed to get back"),
+      actual: z.string().max(2000).optional().describe("What actually came back (error text, empty payload, wrong fields…). Trim page content; a short excerpt is enough."),
+      tool_input: z
+        .record(z.unknown())
+        .optional()
+        .describe("The arguments passed to the failing tool, so the team can reproduce it. Leave out cookies, credentials and anything private."),
+      contact: z
+        .string()
+        .max(200)
+        .optional()
+        .describe("Optional email or handle to follow up on — ask the user before sending it; never send it unasked."),
+    },
+    {
+      title: "Report a bug or request a feature",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    async ({ kind, message, tool, expected, actual, tool_input, contact }) => {
+      const result = await postFeedback({
+        kind,
+        message,
+        tool,
+        expected,
+        actual,
+        toolInput: tool_input,
+        contact,
+        source: "mcp",
+        client: opts.clientInfo?.name
+          ? uaSafe(opts.clientInfo.version ? `${opts.clientInfo.name}/${opts.clientInfo.version}` : opts.clientInfo.name)
+          : undefined,
+        server: MCP_UA_BASE,
+        transport: opts.transport ?? "stdio",
+      });
+      if (!result.ok) {
+        const msg = result.data?.message || result.data?.error || `Request failed (HTTP ${result.status})`;
+        return { content: [{ type: "text", text: `The report could not be sent: ${msg}` }], isError: true };
+      }
+      const id = result.data?.payload?.id;
+      const text =
+        (result.data?.message || "Thanks — your report reached the team.") +
+        (id ? `\nReference: ${id}` : "") +
+        (contact ? "" : "\nNo contact was included, so the team cannot reply to this report.");
+      return { content: [{ type: "text", text }] };
     }
   );
 
